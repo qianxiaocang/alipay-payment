@@ -1,0 +1,27 @@
+# 构建上下文排除项
+# 目的：确保任何敏感配置与密钥都不会进入镜像
+
+# 配置与密钥 —— 绝不进镜像
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 业务数据
+data/
+
+# 开发与测试
+node_modules
+test
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+
+# 日志
+*.log
+logs/
