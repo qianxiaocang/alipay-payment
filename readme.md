@@ -14,9 +14,10 @@
 - [测试](#测试)
 - [上线检查清单](#上线检查清单)
 - [安全红线](#安全红线)
-- [关于 AI 收没有沙箱](#关于-ai-收没有沙箱)
+- [沙箱、以及第一笔真实交易](#沙箱以及第一笔真实交易)
 - [本实现中已踩过的坑](#本实现中已踩过的坑)
 - [运维](#运维)
+- [部署](#部署)
 - [生产化建议](#生产化建议)
 
 ---
@@ -128,8 +129,8 @@ npm test
 | `test/server.test.js` | HTTP 层、响应头、日志脱敏 |
 | `test/gatewayFallback.test.js` | 无签名响应降级、未验签成功拒绝采信 |
 
-> ⚠️ 测试通过只代表**代码逻辑**正确。AI 收没有沙箱，真实链路必须用最小金额
-> 在真实环境验证一次。
+> ⚠️ 测试通过只代表**代码逻辑**正确。真实链路必须用最小金额
+> 在真实环境验证一次（沙箱流程见[沙箱、以及第一笔真实交易](#沙箱以及第一笔真实交易)）。
 
 ---
 
@@ -141,7 +142,7 @@ npm test
 - [ ] 应用私钥为 **PKCS#1** 格式，且**未**做任何格式转换
 - [ ] 支付宝公钥填的是**支付宝公钥**，不是应用公钥（自检脚本会检测填反）
 - [ ] `ALIPAY_AMOUNT` 与入驻时该 `service-id` 的价格一致
-- [ ] `ALIPAY_GATEWAY` 为生产网关（AI 收不支持沙箱）
+- [ ] `ALIPAY_GATEWAY` 为生产网关（本实现仅支持生产网关，不含沙箱分支）
 - [ ] 首次真实联调建议先用最小金额（`0.01`），确认无误后再调回真实价格
 
 ### 服务器时区 ⚠️
@@ -195,17 +196,72 @@ TZ=Asia/Shanghai
 
 ---
 
-## 关于 AI 收没有沙箱
+## 沙箱、以及第一笔真实交易
 
-AI 收**不支持沙箱**，这意味着：
+> **更正说明**：本仓库早期版本写着「AI 收不支持沙箱」，那来自
+> `alipay-payment-integration` 技能。同仓库中的独立技能 `alipay-aipay`（v1.6.8）
+> 实际提供了**完整的 AI 按量付费（402）沙箱**（策略规则 `P-A2M-SANDBOX`：
+> 沙箱 `serviceId` 固定为 `api_mock_service_id`，SDK 使用沙箱网关）。
+> 沙箱网关：`https://openapi-sandbox.dl.alipaydev.com/gateway.do`
 
-- 没有「先拿测试配置练手」的缓冲，第一笔联调就是真实交易；
-- 本仓库的测试只能验证代码逻辑，不能替代真实链路验证；
-- 建议的验证顺序：
-  1. `npm test` 保证代码逻辑正确
-  2. `npm run check-config` 保证配置正确
-  3. 用**最小金额**完成一笔真实支付，确认全链路
-  4. 确认无误后再调回真实价格并放开流量
+### 生产配置是严格的
+
+本项目在生产语义下运行：网关强制生产地址，网关响应缺少 `resource_id` 一律按异常
+处理（`RESOURCE_ID_MISSING`）。这是刻意的 —— 生产环境绝不能让字段缺失被当作校验通过。
+
+如果要用 `alipay-aipay` 的沙箱联调，需要按该技能约定额外支持沙箱网关与
+`.alipay-sandbox.json`；当前实现未包含这部分。
+
+### 跑通第一笔真实交易（0.01 元）
+
+商家侧就是本服务；买家侧需要一个**会付款的 Agent**，由支付宝官方
+`alipay-pay-for-402-service` 技能提供的 `alipay-bot` CLI 承担。
+
+```bash
+# ── 商家侧 ─────────────────────────────────────────────
+cp .env.example .env      # 填正式配置，ALIPAY_AMOUNT=0.01
+npm run check-config      # 必须全绿
+npm start                 # 监听 :3000
+
+# ── 买家侧（另开一个终端）────────────────────────────────
+# 1) 安装买家 CLI（装前必须校验完整性）
+npm view @alipay/agent-payment@1.0.0 dist.integrity
+#    期望 sha512-/Ss+hS75CLYcwC8/jOj2kXzqIoJb7oKGrsiwnqly0EWVTxzD7QY5HxmFuj4anQfHVjnoh77qc2vUYiEAj0zfCA==
+npm install @alipay/agent-payment@1.0.0 && npx @alipay/agent-payment@1.0.0 install-cli
+
+# 2) 检查钱包状态（未开通时会引导走 alipay-authenticate-wallet）
+alipay-bot -- check-wallet
+
+# 3) 取 Payment-Needed 原文（不要解码、不要改写）
+curl -s -D - -o /dev/null http://127.0.0.1:3000/demo/a2m/resource \
+  | grep -i "^Payment-Needed:" | sed "s/^[Pp]ayment-[Nn]eeded: //" | tr -d "\r\n" \
+  > 402_needed_$(date +%s).txt
+
+# 4) 发起支付 → 输出付款链接/二维码，用真实支付宝付 0.01
+alipay-bot -- 402-buyer-pay -f '402_needed_<时间戳>.txt'
+
+# 5) 付款完成后：查询状态并携带凭证重试你的资源接口
+alipay-bot 402-query-payment-status -t '<tradeNo>' -r 'http://127.0.0.1:3000/demo/a2m/resource'
+
+# 6) 发送履约回执
+alipay-bot -- 402-buyer-fulfillment-ack -t '<tradeNo>'
+```
+
+**两个关键实务点：**
+
+1. **第一笔真实交易不需要公网 HTTPS 域名。** 第 5 步是买家 CLI **自己**去重试你的
+   资源地址，所以商家服务和买家 CLI 跑在同一台机器时，用 `http://127.0.0.1:3000`
+   即可。只有付款那一步与支付宝通信。
+2. **`ALIPAY_AMOUNT` 必须与入驻时该 `service-id` 对应的价格一致。** 这不是本地
+   随便填的数字 —— 如果入驻时登记的是固定价，填 `0.01` 会直接失败。上线前务必
+   核对开放平台/服务市场的登记价格。
+
+### 验证顺序建议
+
+1. `npm test` —— 代码逻辑正确（106 个用例，离线、不产生真实交易）
+2. `npm run check-config` —— 配置正确（含密钥往返验签、时区核对、泄漏扫描）
+3. 用**最小金额**完成一笔真实支付，确认全链路（402 → 付款 → 校验 → 履约 → 回执）
+4. 确认无误后再调回真实价格并放开流量
 
 ---
 
@@ -267,8 +323,23 @@ AI 收的 `pay_before` 用 **ISO 8601 带时区偏移**（如 `2026-04-15T12:54:
 | 项 | 风险 | 本实现 |
 | --- | --- | --- |
 | 订单查询 | 无法确认凭证对应的订单 | `store.get()`，缺失返回 404 |
-| 资源ID防串校验 | 用 A 资源的凭证换取 B 资源 | 比对响应/订单/请求三者，不符返回 403 |
-| 履约防重放 | 重复请求导致重复交付 | 原子幂等占位，并发下只交付一次 |
+| 资源ID防串校验 | 用 A 资源的凭证换取 B 资源 | 比对响应/订单/请求三者；**字段缺失按异常处理**（502），存在但不符返回 403 |
+| 履约防重放 | 重复请求导致重复交付 | 两阶段履约 + 每订单互斥，并发下只生成一次资源、只上报一次回执 |
+
+### 7. 可重试的履约回执（已修正）
+
+官方 `alipay-aipay` 参考实现要求：`alipay.aipay.agent.fulfillment.confirm` 失败时
+**不得返回成功交付**，且应允许用同一 Payment-Proof 重试上报。
+
+本实现早期版本是「生成资源即置 FULFILLED，回执失败仅记日志并返回 200」——
+后果是回执永久丢失，重试还会命中「已履约」分支而永不补发。
+现已改为两阶段状态机（见[履约回执补偿](#履约回执补偿)）。
+
+### 8. 老版本会把 `resource_id` 缺失当成校验通过（已修正）
+
+早期判断写成「字段存在才比较」，意味着网关响应里**完全没有** `resource_id` 时
+会直接跳过防串校验。官方文档明确要求「生产环境必须把资源字段缺失当作异常处理」。
+现已改为硬失败（`RESOURCE_ID_MISSING`，502），空串与仅空白也视为缺失。
 
 ---
 
@@ -276,15 +347,36 @@ AI 收的 `pay_before` 用 **ISO 8601 带时区偏移**（如 `2026-04-15T12:54:
 
 ### 履约回执补偿
 
-履约回执上报失败时，服务**仍会向消费者交付已付费的资源**（消费者已付款，
-理应拿到资源），但会把失败信息记入订单，便于补偿：
+履约采用**两阶段**设计，因为官方规范要求「回执上报失败不得返回成功交付，
+且允许用同一 Payment-Proof 重试上报」：
 
-```js
-const pending = store.listPendingFulfillmentConfirm();
-// 对每个 pending 订单重新调用 callFulfillmentConfirm 并 noteFulfillmentConfirm
+```
+PENDING → 生成资源 → PENDING_CONFIRM → 回执确认成功 → FULFILLED
+                          ↑                  |
+                          └──── 失败则停留 ───┘
 ```
 
-建议加一个定时任务处理。
+- 资源在进入 `PENDING_CONFIRM` 时**只生成一次并落库**，重试复用，不会重复生成
+- 回执失败返回 `502 FULFILLMENT_CONFIRM_FAILED`，订单停在 `PENDING_CONFIRM`
+- 消费者用**同一份 Payment-Proof 重试**即可补发回执并闭环
+- `FULFILLED` 一定意味着回执已上报成功
+
+需要兜底时可加定时任务，捞出长时间停留在 `PENDING_CONFIRM` 的订单主动补发：
+
+```js
+const pending = store.listPendingFulfillmentConfirm(); // 停在 PENDING_CONFIRM 的订单
+for (const order of pending) {
+  const r = await callFulfillmentConfirm({ sdk, tradeNo: order.trade_no, validateSign: true });
+  if (r.ok) await store.markFulfilled(order.out_trade_no, order.trade_no);
+}
+```
+
+### 并发与幂等边界
+
+- **进程内**：同一订单的「履约 + 回执」由 `store.withOrderLock()` 互斥，
+  并发携带同一凭证只会生成一次资源、只上报一次回执
+- **多实例**：进程内锁失效，必须改用分布式锁，并以数据库唯一约束
+  作为幂等的最终保证（见「生产化建议」）
 
 ### 接口错误码
 
@@ -294,11 +386,13 @@ const pending = store.listPendingFulfillmentConfirm();
 | `INVALID_PAYMENT_PROOF_FORMAT` | 400 | 凭证格式错误 |
 | `INVALID_PAYMENT_PROOF` | 400 | 凭证无效或已过期 |
 | `ORDER_NOT_FOUND` | 404 | 订单不存在 |
-| `RESOURCE_ID_MISMATCH` | 403 | 资源ID不匹配（疑似资源串改） |
+| `RESOURCE_ID_MISMATCH` | 403 | 资源ID存在但与订单/请求不符（疑似资源串改） |
+| `RESOURCE_ID_MISSING` | 502 | 网关响应缺少资源标识（按异常处理，拒绝交付） |
 | `AMOUNT_MISMATCH` | 400 | 金额不一致 |
 | `VERIFY_FAILED` | 500 | 校验调用失败 |
 | `FULFILLMENT_ERROR` | 500 | 履约处理失败 |
-| `ALREADY_FULFILLED` | 200 | 已履约，不重复提供 |
+| `FULFILLMENT_CONFIRM_FAILED` | 502 | 资源已生成但履约回执未确认，可用同一 Payment-Proof 重试 |
+| `ALREADY_FULFILLED` | 200 | 已履约，复用已落库资源 |
 | `SIGN_ERROR` | 500 | 构造支付请求失败 |
 | `CREATE_ORDER_ERROR` | 500 | 创建订单失败 |
 
@@ -361,10 +455,12 @@ location /demo/a2m/resource {
 | 项 | 现状 | 建议 |
 | --- | --- | --- |
 | 订单存储 | JSON 文件（原子写入 + 串行化） | 多实例部署换 Redis/数据库，并以唯一索引作为幂等的最终保证 |
+| 履约互斥 | 进程内 `withOrderLock` | 多实例部署换分布式锁，否则并发重复请求可能重复上报回执 |
 | 日志 | 极简 console 封装 | 换 pino/winston，接入日志采集 |
 | 限流 | 无 | 资源接口加限流，防止凭证暴力尝试 |
-| 监控 | 无 | 对 402 转化率、校验失败率、回执失败率做监控告警 |
+| 监控 | 无 | 对 402 转化率、校验失败率、回执失败率、`PENDING_CONFIRM` 堆积做监控告警 |
 | 资源生成 | `src/resource.js` 占位实现 | 替换为真实业务逻辑 |
+| 回执补偿 | 提供 `listPendingFulfillmentConfirm()` | 加定时任务补发停留在 `PENDING_CONFIRM` 的订单 |
 
 ---
 

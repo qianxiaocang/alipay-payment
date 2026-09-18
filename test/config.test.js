@@ -272,9 +272,15 @@ test('改写默认配置（charset 等）→ 拒绝', () => {
   });
 });
 
-test('网关改为沙箱 → 拒绝（AI 收不支持沙箱）', () => {
+test('网关改为沙箱 → 拒绝（本实现按生产语义严格实现）', () => {
   withEnv(baseEnv({ ALIPAY_GATEWAY: 'https://openapi-sandbox.dl.alipaydev.com/gateway.do' }), (envPath) => {
-    assert.throws(() => loadConfig({ envPath }), /沙箱/);
+    assert.throws(() => loadConfig({ envPath }), (e) => {
+      assert.ok(e instanceof ConfigError);
+      assert.match(e.message, /仅支持生产网关/);
+      // 报错必须指引到沙箱流程，而不是让用户自己猜
+      assert.ok(e.hints.some((h) => /沙箱/.test(h)), 'hints 应指引到沙箱流程');
+      return true;
+    });
   });
 });
 

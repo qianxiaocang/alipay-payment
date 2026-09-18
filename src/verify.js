@@ -21,9 +21,26 @@ const ERR = {
   INVALID_PAYMENT_PROOF: 'INVALID_PAYMENT_PROOF',
   ORDER_NOT_FOUND: 'ORDER_NOT_FOUND',
   RESOURCE_ID_MISMATCH: 'RESOURCE_ID_MISMATCH',
+  /**
+   * 网关响应缺少 resource_id。
+   *
+   * 官方对接文档要求：生产环境必须把资源字段缺失当作异常处理，
+   * 绝不能让「字段缺失」被当作「校验通过」。单列此码是为了不与
+   * RESOURCE_ID_MISMATCH（字段存在但值与订单不符）混淆，便于排查。
+   */
+  RESOURCE_ID_MISSING: 'RESOURCE_ID_MISSING',
   AMOUNT_MISMATCH: 'AMOUNT_MISMATCH',
   VERIFY_FAILED: 'VERIFY_FAILED',
+  FULFILLMENT_CONFIRM_FAILED: 'FULFILLMENT_CONFIRM_FAILED',
 };
+
+/**
+ * 判断网关返回的字段是否「有值」。
+ * 空字符串与仅空白字符串都视为缺失 —— 沙箱与网关异常都可能返回空串。
+ */
+function hasValue(v) {
+  return v !== undefined && v !== null && String(v).trim() !== '';
+}
 
 /** 业务异常，携带对外错误码与 HTTP 状态 */
 class PaymentError extends Error {
@@ -250,6 +267,7 @@ module.exports = {
   buildPaymentValidation,
   amountEquals,
   pick,
+  hasValue,
   execGateway,
   isUnsignedResponseError,
 };

@@ -23,8 +23,19 @@ const path = require('path');
 
 /** 订单状态 */
 const STATUS = {
+  /** 已下单，待支付 */
   PENDING: 'PENDING',
+  /** 已确认支付（可选中间态） */
   PAID: 'PAID',
+  /**
+   * 资源已生成，履约回执待确认。
+   *
+   * 这是「两阶段履约」的关键中间态：资源只生成一次并落库，
+   * 回执上报失败时订单停在此态，允许用同一份 Payment-Proof 重试上报，
+   * 而不会重新生成资源、也不会丢失回执。
+   */
+  PENDING_CONFIRM: 'PENDING_CONFIRM',
+  /** 履约回执已确认，交易闭环 */
   FULFILLED: 'FULFILLED',
 };
 
@@ -37,6 +48,8 @@ class OrderStore {
     this.orders = new Map();
     /** 串行化写入，避免并发请求互相覆盖 */
     this._queue = Promise.resolve();
+    /** 每订单互斥链，保证同一订单的「履约 + 回执」不会并发重复执行 */
+    this._orderLocks = new Map();
   }
 
   async init() {
@@ -82,6 +95,37 @@ class OrderStore {
   }
 
   /**
+   * 同一订单的互斥执行（进程内）。
+   *
+   * 为什么需要：两阶段履约下，并发携带同一 Payment-Proof 的请求都会走到
+   * 「上报履约回执」这一步，若不做互斥就会对同一 trade_no 重复上报。
+   * 后到的请求会在前一个完成后才进入临界区，此时订单已是 FULFILLED，
+   * 于是直接复用已落库资源、不再重复上报。
+   *
+   * ⚠️ 这是【进程内】锁。多实例部署时无法互斥，必须改用分布式锁，
+   *    并以数据库唯一约束作为幂等的最终保证（见 README「生产化建议」）。
+   *
+   * @template T
+   * @param {string} key
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  withOrderLock(key, fn) {
+    const prev = this._orderLocks.get(key) || Promise.resolve();
+    const run = prev.then(() => fn());
+
+    // 链尾（吞掉异常，避免一次失败阻断后续排队者）
+    const tail = run.then(() => undefined, () => undefined);
+    this._orderLocks.set(key, tail);
+    tail.then(() => {
+      // 只有当自己仍是链尾时才清理，避免误删后来者
+      if (this._orderLocks.get(key) === tail) this._orderLocks.delete(key);
+    });
+
+    return run;
+  }
+
+  /**
    * 创建订单（本地订单为准，用于后续资源校验与幂等）
    */
   create({ outTradeNo, resourceId, amount, payBefore, goodsName }) {
@@ -100,6 +144,8 @@ class OrderStore {
         created_at: new Date().toISOString(),
         paid_at: null,
         fulfilled_at: null,
+        /** 已生成的业务资源（两阶段履约复用，避免重复生成） */
+        service_result: null,
       };
       this.orders.set(outTradeNo, order);
       this._persistSync();
@@ -123,10 +169,70 @@ class OrderStore {
   }
 
   /**
-   * 标记已履约 —— 幂等核心
+   * 两阶段履约 · 第一步：原子占位并【只生成一次】资源。
    *
-   * 若订单已处于 FULFILLED，直接返回 alreadyFulfilled=true，
-   * 调用方必须据此跳过业务逻辑并避免重复交付/重复上报。
+   * 为什么必须是两阶段：
+   *   官方参考实现要求「履约回执上报失败时不得返回成功交付，
+   *   且允许用同一 Payment-Proof 重试上报」。若像单阶段那样在生成资源时
+   *   就直接置为 FULFILLED，回执失败后就再也没有重试机会 ——
+   *   重试会命中「已履约」分支而永远不再补发回执。
+   *
+   * 状态转移：
+   *   PENDING/PAID        → 生成资源 → PENDING_CONFIRM（返回新生成的资源）
+   *   PENDING_CONFIRM     → 复用已落库资源 → PENDING_CONFIRM（不重新生成）
+   *   FULFILLED           → 复用已落库资源 → FULFILLED（已闭环）
+   *
+   * 由于生成与状态转移在同一串行区内完成，并发请求也只会生成一次资源。
+   *
+   * @param {object} args
+   * @param {string} args.outTradeNo
+   * @param {string} [args.tradeNo]
+   * @param {() => string} args.createResource 资源生成函数（仅在需要时调用一次）
+   * @returns {Promise<{order:object|null, state:string|null, serviceResult:string|null, alreadyFulfilled:boolean}>}
+   */
+  prepareFulfillment({ outTradeNo, tradeNo, createResource }) {
+    return this._serial(() => {
+      const order = this.orders.get(outTradeNo);
+      if (!order) {
+        return { order: null, state: null, serviceResult: null, alreadyFulfilled: false };
+      }
+
+      // 已闭环：直接复用
+      if (order.status === STATUS.FULFILLED) {
+        return {
+          order,
+          state: STATUS.FULFILLED,
+          serviceResult: order.service_result ?? null,
+          alreadyFulfilled: true,
+        };
+      }
+
+      // 资源已生成但回执未确认：复用，绝不重新生成
+      if (order.status === STATUS.PENDING_CONFIRM) {
+        return {
+          order,
+          state: STATUS.PENDING_CONFIRM,
+          serviceResult: order.service_result ?? null,
+          alreadyFulfilled: false,
+        };
+      }
+
+      // 首次履约：生成资源并落库
+      const serviceResult = createResource();
+      order.service_result = serviceResult;
+      order.status = STATUS.PENDING_CONFIRM;
+      order.trade_no = tradeNo || order.trade_no;
+      if (!order.paid_at) order.paid_at = new Date().toISOString();
+      this._persistSync();
+
+      return { order, state: STATUS.PENDING_CONFIRM, serviceResult, alreadyFulfilled: false };
+    });
+  }
+
+  /**
+   * 两阶段履约 · 第二步：回执确认成功后闭环。
+   *
+   * 只有支付宝确认收到履约回执后才调用，确保 FULFILLED 一定意味着回执已上报。
    *
    * @returns {Promise<{order:object|null, alreadyFulfilled:boolean}>}
    */
@@ -151,8 +257,9 @@ class OrderStore {
   /**
    * 记录履约回执上报结果
    *
-   * 回执上报失败不应阻止向消费者交付已付费的资源，
-   * 但必须留痕以便后续补偿重试（见 README「履约回执补偿」）。
+   * 回执上报失败时订单停留在 PENDING_CONFIRM，可用同一份 Payment-Proof
+   * 重试上报（会复用已生成资源，不会重复生成）。
+   * 此方法仅留痕，便于运维观察与补偿任务筛选。
    */
   noteFulfillmentConfirm(outTradeNo, { ok, code, subCode, subMsg }) {
     return this._serial(() => {
@@ -172,11 +279,18 @@ class OrderStore {
     });
   }
 
-  /** 列出回执未成功上报的订单，供补偿任务使用 */
+  /**
+   * 列出回执尚未确认的订单，供补偿任务使用。
+   *
+   * 判据是订单停在 PENDING_CONFIRM（资源已生成、回执未闭环），
+   * 而不是「FULFILLED 但 confirm 失败」—— 后者在新语义下不应存在。
+   */
   listPendingFulfillmentConfirm() {
     const out = [];
     for (const order of this.orders.values()) {
-      if (order.status === STATUS.FULFILLED && !order.fulfillment_confirm?.ok) {
+      const stuckAtConfirm = order.status === STATUS.PENDING_CONFIRM;
+      const closedButUnconfirmed = order.status === STATUS.FULFILLED && !order.fulfillment_confirm?.ok;
+      if (stuckAtConfirm || closedButUnconfirmed) {
         out.push(order);
       }
     }

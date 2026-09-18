@@ -42,6 +42,19 @@ function pay(config, store, sdk, header, resourceId) {
   });
 }
 
+/** 同上，但可注入自定义资源生成器（用于验证「资源只生成一次」） */
+function payWith(config, store, sdk, header, generateResource) {
+  return handleResourceRequest({
+    paymentProofHeader: header,
+    config,
+    sdk,
+    store,
+    resourceId: config.resourcePath,
+    generateResource,
+    logger: silentLogger,
+  });
+}
+
 /** 构造一个"支付宝说这个订单已支付"的响应 */
 function paidResponse(outTradeNo, overrides = {}) {
   return {
@@ -362,32 +375,50 @@ test('凭证字段平铺在顶层时也能解析（容错）', async () => {
 
 // ================================================================ 回执失败
 
-test('履约回执上报失败时仍交付资源，并留痕待补偿', async () => {
+test('履约回执上报失败 → 502，订单停在 PENDING_CONFIRM 且资源不重复生成', async () => {
   const { config, store } = await setup();
   const sdk = new FakeSdk();
 
   const first = await initiate(config, store, sdk);
-  sdk.verifyResponse = paidResponse(first.body.out_trade_no);
+  const outTradeNo = first.body.out_trade_no;
+  sdk.verifyResponse = paidResponse(outTradeNo);
   sdk.confirmResponse = { code: '40004', sub_code: 'SYSTEM_ERROR', sub_msg: '系统繁忙' };
 
-  const res = await pay(config, store, sdk, makeProofHeader());
+  let generateCount = 0;
+  const generateResource = () => {
+    generateCount += 1;
+    return `RES_${generateCount}`;
+  };
 
-  // 消费者已付款，应拿到资源
-  assert.equal(res.status, 200);
-  assert.ok(res.body.content);
+  const res = await payWith(config, store, sdk, makeProofHeader(), generateResource);
 
-  const order = store.get(first.body.out_trade_no);
+  // 规范要求：回执未确认成功，不得返回成功交付
+  assert.equal(res.status, 502);
+  assert.equal(res.body.code, 'FULFILLMENT_CONFIRM_FAILED');
+
+  const order = store.get(outTradeNo);
+  assert.equal(order.status, 'PENDING_CONFIRM', '订单应停在待确认态以便重试');
   assert.equal(order.fulfillment_confirm.ok, false);
   assert.equal(order.fulfillment_confirm.sub_code, 'SYSTEM_ERROR');
   assert.equal(order.fulfillment_confirm.attempts, 1);
+  assert.equal(generateCount, 1, '资源只应生成一次');
 
-  // 应可被补偿任务捞出
-  const pending = store.listPendingFulfillmentConfirm();
-  assert.equal(pending.length, 1);
-  assert.equal(pending[0].out_trade_no, first.body.out_trade_no);
+  // 补偿任务应能捞出
+  assert.equal(store.listPendingFulfillmentConfirm().length, 1);
+
+  // 用同一 Payment-Proof 重试 → 补发回执成功，且资源不重新生成
+  sdk.confirmResponse = { code: '10000', msg: 'Success' };
+  const retry = await payWith(config, store, sdk, makeProofHeader(), generateResource);
+
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.already_fulfilled, false);
+  assert.equal(retry.body.content, 'RES_1', '重试必须复用首次生成的资源');
+  assert.equal(generateCount, 1, '重试不得重新生成资源');
+  assert.equal(store.get(outTradeNo).status, 'FULFILLED');
+  assert.equal(store.listPendingFulfillmentConfirm().length, 0);
 });
 
-test('履约回执抛异常时仍交付资源', async () => {
+test('履约回执抛异常 → 502，且订单停在 PENDING_CONFIRM', async () => {
   const { config, store } = await setup();
   const sdk = new FakeSdk();
 
@@ -396,7 +427,10 @@ test('履约回执抛异常时仍交付资源', async () => {
   sdk.confirmResponse = new Error('网络中断');
 
   const res = await pay(config, store, sdk, makeProofHeader());
-  assert.equal(res.status, 200);
+
+  assert.equal(res.status, 502);
+  assert.equal(res.body.code, 'FULFILLMENT_CONFIRM_FAILED');
+  assert.equal(store.get(first.body.out_trade_no).status, 'PENDING_CONFIRM');
   assert.equal(store.get(first.body.out_trade_no).fulfillment_confirm.ok, false);
 });
 

@@ -9,7 +9,7 @@
  *      ⛔ 严禁自行做格式转换、严禁手工拼接 PEM 头尾。
  *   2. 默认配置固定：sign-type=RSA2、charset=UTF-8、format=json、currency=CNY。
  *      SDK 的 charset 类型只接受小写 'utf-8'，因此对外保持 UTF-8、传 SDK 时归一化。
- *   3. AI 收不支持沙箱，网关固定生产网关。
+ *   3. 本实现按生产语义严格实现，网关固定生产网关（不含沙箱分支）。
  *   4. 任何敏感值都不得进入日志。
  */
 
@@ -256,7 +256,14 @@ function loadConfig(opts = {}) {
 
   const gateway = (process.env.ALIPAY_GATEWAY || '').trim() || PROD_GATEWAY;
   if (gateway !== PROD_GATEWAY) {
-    throw new ConfigError(`AI 收不支持沙箱，网关必须为 ${PROD_GATEWAY}，当前为 ${gateway}`);
+    // 说明：AI 按量付费确实存在沙箱（见 alipay-aipay 技能，沙箱网关为
+    // openapi-sandbox.dl.alipaydev.com，serviceId 固定为 api_mock_service_id）。
+    // 本实现按生产语义严格实现，未包含沙箱分支，因此在此明确拒绝，
+    // 避免误用沙箱配置却按生产规则校验而产生难以排查的差异。
+    throw new ConfigError(
+      `本实现仅支持生产网关 ${PROD_GATEWAY}，当前为 ${gateway}`,
+      ['如需沙箱联调，请使用 alipay-aipay 技能的沙箱流程与对应实现'],
+    );
   }
 
   const priv = readFileOrInline('ALIPAY_APP_PRIVATE_KEY', 'ALIPAY_APP_PRIVATE_KEY_FILE', '应用私钥');

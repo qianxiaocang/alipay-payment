@@ -5,7 +5,7 @@
  * 服务启动入口
  *
  * 启动顺序刻意设计为「配置不合法就拒绝启动」：
- *   AI 收没有沙箱，带着错误配置启动等于把资金风险直接暴露到线上。
+ *   本服务按生产语义运行，带着错误配置启动等于把资金风险直接暴露到线上。
  */
 
 const { loadConfig, ConfigError } = require('../src/config');
@@ -48,7 +48,7 @@ async function main() {
     logger.info('  截止时间 : %d 分钟', config.payBeforeMinutes);
     logger.info('  私钥来源 : %s', config.privateKeySource);
     logger.info('  网关     : %s', config.gateway);
-    logger.info('提示：AI 收无沙箱，以下每笔请求都是真实交易');
+    logger.info('提示：当前为生产配置，以下每笔请求都是真实交易');
   });
 
   const shutdown = (signal) => {

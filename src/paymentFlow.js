@@ -31,9 +31,11 @@ const {
   callFulfillmentConfirm,
   buildPaymentValidation,
   amountEquals,
+  hasValue,
 } = require('./verify');
 const { generateOutTradeNo } = require('./signing');
 const { generateDefaultResource } = require('./resource');
+const { STATUS } = require('./store');
 
 /**
  * 处理一次资源请求
@@ -196,21 +198,33 @@ async function handlePaidRequest({
   }
 
   // 6. 资源ID防串校验
-  //    响应里的 resource_id 必须与本地订单记录、以及本次请求的资源一致
-  if (result.resourceId !== undefined && result.resourceId !== null) {
-    if (String(result.resourceId) !== String(order.resource_id)) {
-      logger.error(
-        '[aipay] 资源ID不匹配（疑似资源串改）out_trade_no=%s 期望=%s 实际=%s',
-        outTradeNo,
-        order.resource_id,
-        result.resourceId,
-      );
-      return {
-        status: 403,
-        headers: {},
-        body: { code: ERR.RESOURCE_ID_MISMATCH, message: '资源 ID 不匹配，可能存在资源串改风险' },
-      };
-    }
+  //    响应里的 resource_id 必须存在，且与本地订单、本次请求三者一致。
+  //    ⚠️ 官方对接文档要求「生产环境必须把资源字段缺失当作异常处理」——
+  //    字段缺失绝不能被当作校验通过。原实现写的是「存在才比较」，
+  //    等于给伪造/异常响应留了一个直接绕过防串校验的口子，这里修正为硬失败。
+  if (!hasValue(result.resourceId)) {
+    logger.error('[aipay] 网关响应缺少 resource_id，按异常处理 out_trade_no=%s', outTradeNo);
+    return {
+      status: 502,
+      headers: {},
+      body: {
+        code: ERR.RESOURCE_ID_MISSING,
+        message: '网关响应缺少资源标识，无法确认资源归属，已拒绝交付',
+      },
+    };
+  }
+  if (String(result.resourceId) !== String(order.resource_id)) {
+    logger.error(
+      '[aipay] 资源ID不匹配（疑似资源串改）out_trade_no=%s 期望=%s 实际=%s',
+      outTradeNo,
+      order.resource_id,
+      result.resourceId,
+    );
+    return {
+      status: 403,
+      headers: {},
+      body: { code: ERR.RESOURCE_ID_MISMATCH, message: '资源 ID 不匹配，可能存在资源串改风险' },
+    };
   }
   if (String(order.resource_id) !== String(resourceId)) {
     logger.error(
@@ -227,7 +241,8 @@ async function handlePaidRequest({
   }
 
   // 7. 金额校验（防御性：确保实付与下单一致）
-  if (result.amount !== undefined && result.amount !== null && !amountEquals(result.amount, order.amount)) {
+  //    hasValue 把空串也视为缺失；金额缺失不作为放行理由，但单独走 RESOURCE_ID 之外的路径
+  if (hasValue(result.amount) && !amountEquals(result.amount, order.amount)) {
     logger.error(
       '[aipay] 金额不匹配 out_trade_no=%s 期望=%s 实际=%s',
       outTradeNo,
@@ -241,38 +256,79 @@ async function handlePaidRequest({
     };
   }
 
-  // 8. 幂等占位（防重放 / 防并发重复履约）
-  //    先原子占位再执行业务，避免并发请求同时通过校验后重复交付
-  const claim = await store.markFulfilled(outTradeNo, tradeNo);
+  // 8 + 9. 两阶段履约（同一订单互斥执行，避免并发重复上报回执）
+  //   · 第一步 prepareFulfillment：原子占位并【只生成一次】资源，资源落库
+  //   · 第二步 上报履约回执：确认成功才闭环为 FULFILLED
+  //
+  //   规范要求「回执上报失败不得返回成功交付，且允许用同一 Payment-Proof 重试」，
+  //   因此失败时订单停留在 PENDING_CONFIRM：重试会复用已生成资源、只补发回执。
+  const outcome = await store.withOrderLock(outTradeNo, async () => {
+    let prepared;
+    try {
+      prepared = await store.prepareFulfillment({
+        outTradeNo,
+        tradeNo,
+        createResource: () => generateResource({ resourceId: order.resource_id, outTradeNo, tradeNo }),
+      });
+    } catch (err) {
+      logger.error('[aipay] 生成资源失败 out_trade_no=%s: %s', outTradeNo, err.message);
+      return { kind: 'error' };
+    }
 
-  if (claim.alreadyFulfilled) {
-    logger.info('[aipay] 订单已履约，跳过重复交付 out_trade_no=%s', outTradeNo);
-    return {
-      status: 200,
-      headers: {
-        'Payment-Validation': buildPaymentValidation({
-          tradeNo,
-          outTradeNo,
-          resourceId: order.resource_id,
-        }),
-      },
-      body: {
-        code: 'ALREADY_FULFILLED',
-        message: '订单已履约，不重复提供',
-        resource_id: order.resource_id,
-        trade_no: tradeNo,
-        out_trade_no: outTradeNo,
-        already_fulfilled: true,
-      },
-    };
-  }
+    if (!prepared.order || !hasValue(prepared.serviceResult)) {
+      logger.error('[aipay] 履约占位未返回已落库资源 out_trade_no=%s', outTradeNo);
+      return { kind: 'error' };
+    }
 
-  // 9. 生成资源（替换为你自己的业务逻辑）
-  let content;
-  try {
-    content = generateResource({ resourceId: order.resource_id, outTradeNo, tradeNo });
-  } catch (err) {
-    logger.error('[aipay] 生成资源失败 out_trade_no=%s: %s', outTradeNo, err.message);
+    // 已闭环（含并发后来者）：复用已落库资源，不重复生成、不重复上报
+    if (prepared.state === STATUS.FULFILLED) {
+      return { kind: 'already', serviceResult: prepared.serviceResult };
+    }
+
+    let confirmResult;
+    try {
+      confirmResult = await callFulfillmentConfirm({
+        sdk,
+        tradeNo,
+        validateSign: config.validateResponseSign,
+      });
+    } catch (err) {
+      confirmResult = { ok: false, code: 'EXCEPTION', subMsg: err.message };
+    }
+
+    try {
+      await store.noteFulfillmentConfirm(outTradeNo, {
+        ok: confirmResult.ok,
+        code: confirmResult.code,
+        subCode: confirmResult.subCode,
+        subMsg: confirmResult.subMsg,
+      });
+    } catch (err) {
+      logger.warn('[aipay] 记录履约回执状态失败 out_trade_no=%s: %s', outTradeNo, err.message);
+    }
+
+    if (!confirmResult.ok) {
+      logger.error(
+        '[aipay] 履约回执上报失败，资源已生成但未确认交付 out_trade_no=%s code=%s sub_code=%s',
+        outTradeNo,
+        confirmResult.code,
+        confirmResult.subCode,
+      );
+      return { kind: 'confirm_failed' };
+    }
+
+    await store.markFulfilled(outTradeNo, tradeNo);
+    logger.info('[aipay] 履约成功 out_trade_no=%s trade_no=%s', outTradeNo, tradeNo);
+    return { kind: 'fulfilled', serviceResult: prepared.serviceResult };
+  });
+
+  const paymentValidation = buildPaymentValidation({
+    tradeNo,
+    outTradeNo,
+    resourceId: order.resource_id,
+  });
+
+  if (outcome.kind === 'error') {
     return {
       status: 500,
       headers: {},
@@ -280,55 +336,42 @@ async function handlePaidRequest({
     };
   }
 
-  // 10. 上报履约回执
-  //     上报失败不阻断交付（消费者已付款，应拿到资源），
-  //     但会留痕以便补偿重试
-  let confirmResult;
-  try {
-    confirmResult = await callFulfillmentConfirm({
-      sdk,
-      tradeNo,
-      validateSign: config.validateResponseSign,
-    });
-    if (!confirmResult.ok) {
-      logger.error(
-        '[aipay] 履约回执上报失败 out_trade_no=%s code=%s sub_code=%s',
-        outTradeNo,
-        confirmResult.code,
-        confirmResult.subCode,
-      );
-    }
-  } catch (err) {
-    confirmResult = { ok: false, code: 'EXCEPTION', subMsg: err.message };
-    logger.error('[aipay] 履约回执上报异常 out_trade_no=%s: %s', outTradeNo, err.message);
+  if (outcome.kind === 'confirm_failed') {
+    return {
+      status: 502,
+      headers: {},
+      body: {
+        code: ERR.FULFILLMENT_CONFIRM_FAILED,
+        message: '资源已生成但履约确认失败，请稍后使用同一 Payment-Proof 重试',
+      },
+    };
   }
 
-  try {
-    await store.noteFulfillmentConfirm(outTradeNo, {
-      ok: confirmResult.ok,
-      code: confirmResult.code,
-      subCode: confirmResult.subCode,
-      subMsg: confirmResult.subMsg,
-    });
-  } catch (err) {
-    logger.warn('[aipay] 记录履约回执状态失败 out_trade_no=%s: %s', outTradeNo, err.message);
+  // 已闭环：复用已落库资源
+  if (outcome.kind === 'already') {
+    logger.info('[aipay] 订单已履约，复用已落库资源 out_trade_no=%s', outTradeNo);
+    return {
+      status: 200,
+      headers: { 'Payment-Validation': paymentValidation },
+      body: {
+        code: 'ALREADY_FULFILLED',
+        message: '订单已履约，不重复提供',
+        resource_id: order.resource_id,
+        content: outcome.serviceResult,
+        trade_no: tradeNo,
+        out_trade_no: outTradeNo,
+        already_fulfilled: true,
+      },
+    };
   }
-
-  logger.info('[aipay] 履约成功 out_trade_no=%s trade_no=%s', outTradeNo, tradeNo);
 
   // 11. 返回资源 + Payment-Validation
   return {
     status: 200,
-    headers: {
-      'Payment-Validation': buildPaymentValidation({
-        tradeNo,
-        outTradeNo,
-        resourceId: order.resource_id,
-      }),
-    },
+    headers: { 'Payment-Validation': paymentValidation },
     body: {
       resource_id: order.resource_id,
-      content,
+      content: outcome.serviceResult,
       trade_no: tradeNo,
       out_trade_no: outTradeNo,
       already_fulfilled: false,
