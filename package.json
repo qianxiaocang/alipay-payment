@@ -10,8 +10,9 @@
   "scripts": {
     "start": "node bin/serve.js",
     "dev": "node --watch bin/serve.js",
+    "business-api": "node examples/business-api.js",
     "check-config": "node scripts/check-config.js",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {
     "alipay-sdk": "^4.14.0",

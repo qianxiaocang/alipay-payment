@@ -437,7 +437,10 @@ function loadConfig(opts = {}) {
     businessApiIdempotencyHeader:
       (process.env.BUSINESS_API_IDEMPOTENCY_HEADER || '').trim() || 'Idempotency-Key',
     businessApiPassQuery: (process.env.BUSINESS_API_PASS_QUERY || 'true').trim().toLowerCase() !== 'false',
-    resourceWrapResponse: (process.env.RESOURCE_WRAP_RESPONSE || 'true').trim().toLowerCase() !== 'false',
+    // 默认 false：直接把业务 API 原文作为 content。
+    // 归因字段（resource_id/trade_no/out_trade_no）恒在外层响应体上，
+    // 不依赖这层包裹；而包裹会多套一层 data，容易让消费方「字段明明返回了却找不到」。
+    resourceWrapResponse: (process.env.RESOURCE_WRAP_RESPONSE || 'false').trim().toLowerCase() === 'true',
     resourceServiceType: (process.env.RESOURCE_SERVICE_TYPE || '').trim() || 'API_CALL',
     bindPayload,
     maxBodyBytes: Number(maxBodyRaw),

@@ -200,10 +200,61 @@ BUSINESS_API_IDEMPOTENCY_HEADER=Idempotency-Key
 }
 ```
 
-不想要这层包裹就设 `RESOURCE_WRAP_RESPONSE=false`，直接返回上游原文。
+**默认 `RESOURCE_WRAP_RESPONSE=false`**：`content` 直接就是业务 API 原文，消费方读
+`JSON.parse(body.content).<字段>`。
+设为 `true` 则会包一层，字段会多套一层 `data`：`JSON.parse(body.content).data.<字段>`。
+
+> 归因字段（`resource_id` / `trade_no` / `out_trade_no`）恒在**外层响应体**上，
+> 与这层包裹无关 —— 所以关掉包裹不会丢失可归属性。
 
 **安全**：只转发 `content-type` / `accept` 与你的鉴权头，
 **绝不转发 `Payment-Proof` / `Payment-Validation`** 给业务 API。
+
+### 本地联调：示例业务 API 桩
+
+仓库自带一个可直接跑的桩，用来把链路端到端跑通（**不花钱、不用等真实业务接口就绪**）：
+
+```bash
+# 终端 1：起桩
+npm run business-api
+# → http://127.0.0.1:4000/paid-api
+
+# 终端 2：配置主服务指向它
+RESOURCE_PROVIDER=api
+BUSINESS_API_URL=http://127.0.0.1:4000/paid-api
+RESOURCE_WRAP_RESPONSE=false
+```
+
+桩返回 `{ ok: true, pick_token, out_trade_no, echo, ... }`，其中：
+
+- `pick_token` 由**幂等键（out_trade_no）确定性推导** —— 同一订单重复调用得到同一 token，
+  直观体现幂等键的作用
+- `echo` 回显买家的 body / query —— 用来确认请求真的被透传过来了
+- 支持失败注入，用于验证「上游失败 → 订单保持可重试」：
+  `?fail=500` / `?fail=empty` / `?fail=slow`
+
+**上线前必须替换为你的真实业务接口**，桩只是联调占位。
+
+#### 不花钱的预检
+
+真实支付前先用这个确认「履约到底会返回什么」，避免白花一笔：
+
+```bash
+PREFLIGHT_BODY='{"prompt":"hi"}' node -e '
+const { loadConfig } = require("./src/config");
+const { createResourceProvider } = require("./src/resource");
+const c = loadConfig();
+createResourceProvider(c)({
+  resourceId: c.resourcePath, outTradeNo: "ORDER_PREFLIGHT", tradeNo: "T",
+  request: { method: "POST", query: {}, body: process.env.PREFLIGHT_BODY, headers: {} },
+}).then((out) => {
+  console.log(out);
+  const p = JSON.parse(out);
+  console.log("顶层键:", Object.keys(p).join(", "));
+  console.log("pick_token:", p.pick_token);
+}).catch((e) => { console.error("失败:", e.message); process.exit(1); });
+'
+```
 
 ### ⚠️ 载荷绑定：防「低价付款、高价调用」
 
@@ -268,6 +319,7 @@ npm test
 | `test/paymentNeeded.test.js` | 402 载荷分层结构、字段完备性、签名可验签性 |
 | `test/config.test.js` | 配置校验、PKCS#1/PKCS#8 识别、默认项强制、网关限制、清单缺口回归 |
 | `test/repositoryJsonFile.test.js` | 仓储契约：持久化、原子写入、生成认领、回执认领与租约 |
+| `test/businessApiExample.test.js` | 示例业务 API 桩：幂等 token、回显透传、失败注入 |
 | `test/resourceProvider.test.js` | 请求指纹、业务 API 转发、鉴权与幂等键、不泄露支付头、超时/非 2xx/空响应 |
 | `test/repositorySql.test.js` | 方言适配、迁移文件一致性；真库契约测试（需 `TEST_DB_DIALECT`） |
 | `test/flow.test.js` | 两个场景全流程 + 各类拒绝分支 + 并发防重放 |
