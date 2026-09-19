@@ -34,8 +34,12 @@ const {
   hasValue,
 } = require('./verify');
 const { generateOutTradeNo } = require('./signing');
-const { generateDefaultResource } = require('./resource');
+const { createStaticProvider } = require('./resource');
+const { fingerprint } = require('./requestContext');
 const { STATUS } = require('./repository/contract');
+
+/** 未显式提供资源生成器时的兜底（仅占位内容，用于跑通链路与测试） */
+const fallbackResourceProvider = createStaticProvider();
 
 /**
  * 处理一次资源请求
@@ -56,13 +60,14 @@ async function handleResourceRequest({
   sdk,
   repository,
   resourceId,
-  generateResource = generateDefaultResource,
+  requestContext = null,
+  generateResource = fallbackResourceProvider,
   logger = console,
 }) {
   const hasProof = Boolean(paymentProofHeader && String(paymentProofHeader).trim());
   return hasProof
-    ? handlePaidRequest({ paymentProofHeader, config, sdk, repository, resourceId, generateResource, logger })
-    : handleInitialRequest({ config, repository, resourceId, logger });
+    ? handlePaidRequest({ paymentProofHeader, config, sdk, repository, resourceId, requestContext, generateResource, logger })
+    : handleInitialRequest({ config, repository, resourceId, requestContext, logger });
 }
 
 // ---------------------------------------------------------------- 场景一
@@ -70,8 +75,14 @@ async function handleResourceRequest({
 /**
  * 首次请求：本地构造订单并返回 402
  */
-async function handleInitialRequest({ config, repository, resourceId, logger }) {
+async function handleInitialRequest({ config, repository, resourceId, requestContext, logger }) {
   const outTradeNo = generateOutTradeNo();
+
+  // 记录「被收费的那次请求」的指纹，二次请求时比对。
+  // 402 协议本身无法承载载荷哈希，所以绑定只能在服务端做（详见 requestContext.js）。
+  const payloadFingerprint = config.bindPayload && requestContext
+    ? fingerprint(requestContext)
+    : null;
 
   let built;
   try {
@@ -93,6 +104,7 @@ async function handleInitialRequest({ config, repository, resourceId, logger }) 
       payBefore: built.order.pay_before,
       goodsName: built.order.goods_name,
       currency: built.order.currency,
+      payloadFingerprint,
     });
   } catch (err) {
     logger.error('[aipay] 创建订单失败: %s', err.message);
@@ -128,6 +140,7 @@ async function handlePaidRequest({
   sdk,
   repository,
   resourceId,
+  requestContext,
   generateResource,
   logger,
 }) {
@@ -199,6 +212,30 @@ async function handlePaidRequest({
     };
   }
 
+  // 5.1 载荷绑定校验
+  //     攻击场景：用一个便宜/无害的请求拿到 402 并付款 0.01，
+  //     然后带着同一份 Payment-Proof 重放一个**完全不同、成本高得多**的请求。
+  //     凭证是有效的，若不绑定载荷就会被放行 —— 等于低价买了高价调用。
+  //     402 协议没有可承载载荷哈希的字段，因此绑定只能在服务端完成。
+  if (config.bindPayload && order.payload_fingerprint) {
+    const current = requestContext ? fingerprint(requestContext) : null;
+    if (!current || current !== order.payload_fingerprint) {
+      logger.error(
+        '[aipay] 请求载荷与下单时不一致，拒绝执行 out_trade_no=%s（当前指纹 %s）',
+        outTradeNo,
+        current ? current.slice(0, 12) : '不可用',
+      );
+      return {
+        status: 409,
+        headers: {},
+        body: {
+          code: ERR.PAYLOAD_MISMATCH,
+          message: '本次请求内容与下单时不一致，已拒绝执行；请重新发起并完成支付',
+        },
+      };
+    }
+  }
+
   // 6. 资源ID防串校验
   //    响应里的 resource_id 必须存在，且与本地订单、本次请求三者一致。
   //    ⚠️ 官方对接文档要求「生产环境必须把资源字段缺失当作异常处理」——
@@ -258,27 +295,21 @@ async function handlePaidRequest({
     };
   }
 
-  // 8. 两阶段履约 · 第一步：原子占位并【只生成一次】资源，资源落库
-  //    SQL 实现靠事务 + 行锁，文件实现靠串行队列；两者都保证并发/多实例下
-  //    createResource 只被调用一次。
-  let prepared;
+  // 8. 资源生成：认领（快、原子）→ 生成（慢、锁外）→ 落库（快、原子）
+  //
+  //    为什么不能像早期实现那样「持锁期间生成」：对「API 按次付费」而言
+  //    生成 = 调用后端业务 API，是数秒级的慢操作。持锁做 I/O 会让 JSON 实现
+  //    阻塞整个服务、让 SQL 实现长期占住行锁与连接池。
+  //    因此用【生成租约】保证「同一订单只有一个执行者真的去调业务 API」，
+  //    且持有者崩溃后租约过期可被接管。
+  let outcome = null;
   try {
-    prepared = await repository.prepareFulfillment({
+    outcome = await repository.claimFulfillmentGeneration({
       outTradeNo,
-      tradeNo,
-      createResource: () => generateResource({ resourceId: order.resource_id, outTradeNo, tradeNo }),
+      leaseMs: config.generateLeaseMs,
     });
   } catch (err) {
-    logger.error('[aipay] 生成资源失败 out_trade_no=%s: %s', outTradeNo, err.message);
-    return {
-      status: 500,
-      headers: {},
-      body: { code: 'FULFILLMENT_ERROR', message: '履约处理失败' },
-    };
-  }
-
-  if (!prepared.order || !hasValue(prepared.serviceResult)) {
-    logger.error('[aipay] 履约占位未返回已落库资源 out_trade_no=%s', outTradeNo);
+    logger.error('[aipay] 认领资源生成权失败 out_trade_no=%s: %s', outTradeNo, err.message);
     return {
       status: 500,
       headers: {},
@@ -306,10 +337,96 @@ async function handlePaidRequest({
     },
   });
 
+  if (outcome.state === 'NOT_FOUND') {
+    logger.warn('[aipay] 订单不存在 out_trade_no=%s', outTradeNo);
+    return {
+      status: 404,
+      headers: {},
+      body: { code: ERR.ORDER_NOT_FOUND, message: '订单不存在' },
+    };
+  }
+
   // 已闭环（含并发/多实例的后来者）：复用已落库资源，不重复生成、不重复上报
-  if (prepared.state === STATUS.FULFILLED) {
+  if (outcome.state === STATUS.FULFILLED) {
     logger.info('[aipay] 订单已履约，复用已落库资源 out_trade_no=%s', outTradeNo);
-    return alreadyFulfilledResponse(prepared.serviceResult);
+    return alreadyFulfilledResponse(outcome.serviceResult);
+  }
+
+  let serviceResult = outcome.serviceResult;
+
+  // 资源尚未生成：本次拿到生成权则去生成，否则说明他人正在生成
+  if (outcome.state === 'CLAIMED') {
+    try {
+      serviceResult = await generateResource({
+        resourceId: order.resource_id,
+        outTradeNo,
+        tradeNo,
+        request: requestContext,
+      });
+    } catch (err) {
+      // 生成失败：释放生成权，订单留在可重试态，且【不得】上报履约回执
+      logger.error('[aipay] 生成资源失败 out_trade_no=%s: %s', outTradeNo, err.message);
+      try {
+        await repository.releaseFulfillmentGeneration({ outTradeNo });
+      } catch (releaseErr) {
+        logger.warn('[aipay] 释放生成权失败 out_trade_no=%s: %s', outTradeNo, releaseErr.message);
+      }
+      return {
+        status: 500,
+        headers: {},
+        body: { code: 'FULFILLMENT_ERROR', message: '履约处理失败' },
+      };
+    }
+
+    if (!hasValue(serviceResult)) {
+      logger.error('[aipay] 资源生成返回空内容 out_trade_no=%s', outTradeNo);
+      try {
+        await repository.releaseFulfillmentGeneration({ outTradeNo });
+      } catch { /* 已在上面记录过失败原因 */ }
+      return {
+        status: 500,
+        headers: {},
+        body: { code: 'FULFILLMENT_ERROR', message: '履约处理失败' },
+      };
+    }
+
+    try {
+      const stored = await repository.storeFulfillmentResult({ outTradeNo, tradeNo, serviceResult });
+      // 落库时若已有资源（并发下他人先写入），以已落库的为准
+      if (stored && hasValue(stored.service_result)) serviceResult = stored.service_result;
+    } catch (err) {
+      logger.error('[aipay] 资源落库失败 out_trade_no=%s: %s', outTradeNo, err.message);
+      return {
+        status: 500,
+        headers: {},
+        body: { code: 'FULFILLMENT_ERROR', message: '履约处理失败' },
+      };
+    }
+  } else if (outcome.state === 'IN_PROGRESS') {
+    // 他人正在生成：有界等待其落库
+    const settled = await waitForGenerated(repository, outTradeNo, config.confirmWaitMs);
+    if (settled && hasValue(settled.service_result)) {
+      serviceResult = settled.service_result;
+    } else {
+      logger.warn('[aipay] 资源正在由其他执行者生成 out_trade_no=%s', outTradeNo);
+      return {
+        status: 502,
+        headers: {},
+        body: {
+          code: ERR.FULFILLMENT_CONFIRM_FAILED,
+          message: '履约正在处理中，请稍后使用同一 Payment-Proof 重试',
+        },
+      };
+    }
+  }
+
+  if (!hasValue(serviceResult)) {
+    logger.error('[aipay] 未能取得可用资源 out_trade_no=%s', outTradeNo);
+    return {
+      status: 500,
+      headers: {},
+      body: { code: 'FULFILLMENT_ERROR', message: '履约处理失败' },
+    };
   }
 
   // 9. 两阶段履约 · 第二步：认领回执上报权后再上报
@@ -338,7 +455,7 @@ async function handlePaidRequest({
     const settled = await waitForFulfilled(repository, outTradeNo, config.confirmWaitMs);
     if (settled) {
       logger.info('[aipay] 回执由其他执行者完成，复用结果 out_trade_no=%s', outTradeNo);
-      return alreadyFulfilledResponse(settled.service_result ?? prepared.serviceResult);
+      return alreadyFulfilledResponse(settled.service_result ?? serviceResult);
     }
     logger.warn('[aipay] 回执正在被其他执行者上报中 out_trade_no=%s', outTradeNo);
     return {
@@ -401,7 +518,7 @@ async function handlePaidRequest({
     headers: { 'Payment-Validation': paymentValidation },
     body: {
       resource_id: order.resource_id,
-      content: prepared.serviceResult,
+      content: serviceResult,
       trade_no: tradeNo,
       out_trade_no: outTradeNo,
       already_fulfilled: false,
@@ -424,6 +541,28 @@ async function handlePaidRequest({
  * @returns {Promise<object|null>} 已闭环的订单（含 service_result），超时返回 null
  */
 async function waitForFulfilled(repository, outTradeNo, timeoutMs) {
+  return waitForOrderState(repository, outTradeNo, timeoutMs, (o) => o.status === STATUS.FULFILLED);
+}
+
+/**
+ * 等待「其他执行者」把资源生成并落库。
+ *
+ * 场景：本请求没拿到生成权（IN_PROGRESS），说明另一个执行者（可能是另一个实例）
+ * 正在调用业务 API。这里做有界轮询，对方落库后直接复用其结果。
+ *
+ * @returns {Promise<object|null>}
+ */
+async function waitForGenerated(repository, outTradeNo, timeoutMs) {
+  return waitForOrderState(repository, outTradeNo, timeoutMs, (o) => hasValue(o.service_result));
+}
+
+/**
+ * 有界轮询订单直到满足条件或超时。读取抖动不打断等待，交由超时处理。
+ *
+ * @param {(order:object)=>boolean} predicate
+ * @returns {Promise<object|null>}
+ */
+async function waitForOrderState(repository, outTradeNo, timeoutMs, predicate) {
   if (!timeoutMs || timeoutMs <= 0) return null;
   const deadline = Date.now() + timeoutMs;
   const intervalMs = 25;
@@ -432,9 +571,9 @@ async function waitForFulfilled(repository, outTradeNo, timeoutMs) {
     await new Promise((r) => setTimeout(r, intervalMs));
     try {
       const current = await repository.get(outTradeNo);
-      if (current && current.status === STATUS.FULFILLED) return current;
+      if (current && predicate(current)) return current;
     } catch {
-      // 读取失败不应打断等待，交由外层超时处理
+      // 忽略读取抖动，继续等待
     }
   }
   return null;

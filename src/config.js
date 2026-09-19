@@ -352,6 +352,49 @@ function loadConfig(opts = {}) {
     throw new ConfigError(`CONFIRM_WAIT_MS 应为非负整数（毫秒），当前：${waitRaw}`);
   }
 
+  // 资源生成租约：持有者崩溃后超过此时长可被其它实例接管生成
+  const genLeaseRaw = (process.env.GENERATE_LEASE_MS || '').trim() || '60000';
+  if (!/^\d+$/.test(genLeaseRaw) || Number(genLeaseRaw) <= 0) {
+    throw new ConfigError(`GENERATE_LEASE_MS 应为正整数（毫秒），当前：${genLeaseRaw}`);
+  }
+
+  // ---------------------------------------------------------------- 资源 provider
+
+  const resourceProvider = ((process.env.RESOURCE_PROVIDER || '').trim() || 'static').toLowerCase();
+  if (!['static', 'api'].includes(resourceProvider)) {
+    throw new ConfigError(`RESOURCE_PROVIDER 必须为 static 或 api，当前为 ${resourceProvider}`);
+  }
+
+  const businessApiUrl = (process.env.BUSINESS_API_URL || '').trim();
+  if (resourceProvider === 'api' && !businessApiUrl) {
+    throw new ConfigError('RESOURCE_PROVIDER=api 时必须配置 BUSINESS_API_URL', [
+      '该项指向你自己的业务 API，买家付费后会被调用一次',
+    ]);
+  }
+  if (businessApiUrl && !/^https?:\/\//.test(businessApiUrl)) {
+    throw new ConfigError(`BUSINESS_API_URL 必须是 http(s) 地址，当前：${businessApiUrl}`);
+  }
+
+  const businessApiMethod = ((process.env.BUSINESS_API_METHOD || '').trim() || 'POST').toUpperCase();
+  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(businessApiMethod)) {
+    throw new ConfigError(`BUSINESS_API_METHOD 不受支持：${businessApiMethod}`);
+  }
+
+  const apiTimeoutRaw = (process.env.BUSINESS_API_TIMEOUT_MS || '').trim() || '15000';
+  if (!/^\d+$/.test(apiTimeoutRaw) || Number(apiTimeoutRaw) <= 0) {
+    throw new ConfigError(`BUSINESS_API_TIMEOUT_MS 应为正整数（毫秒），当前：${apiTimeoutRaw}`);
+  }
+
+  // 载荷绑定：把「被收费的那次请求」与「实际执行的请求」绑定，防止低价付款+高价调用
+  const bindPayload = (process.env.RESOURCE_BIND_PAYLOAD || 'true').trim().toLowerCase() !== 'false';
+
+  // 请求体大小上限（字节）。按次付费的 API 常见为 JSON 入参，1MB 足够；
+  // 调大可放宽，但要注意这也是单次请求的成本上界。
+  const maxBodyRaw = (process.env.MAX_BODY_BYTES || '').trim() || '1048576';
+  if (!/^\d+$/.test(maxBodyRaw) || Number(maxBodyRaw) <= 0) {
+    throw new ConfigError(`MAX_BODY_BYTES 应为正整数（字节），当前：${maxBodyRaw}`);
+  }
+
   const config = {
     envPath: env.path,
     envLoaded: env.loaded,
@@ -383,6 +426,21 @@ function loadConfig(opts = {}) {
     dbTable: (process.env.DB_TABLE || '').trim() || 'aipay_orders',
     confirmLeaseMs: Number(leaseRaw),
     confirmWaitMs: Number(waitRaw),
+    generateLeaseMs: Number(genLeaseRaw),
+
+    resourceProvider,
+    businessApiUrl: businessApiUrl || null,
+    businessApiMethod,
+    businessApiTimeoutMs: Number(apiTimeoutRaw),
+    businessApiAuthHeader: (process.env.BUSINESS_API_AUTH_HEADER || '').trim() || null,
+    businessApiAuthValue: (process.env.BUSINESS_API_AUTH_VALUE || '').trim() || null,
+    businessApiIdempotencyHeader:
+      (process.env.BUSINESS_API_IDEMPOTENCY_HEADER || '').trim() || 'Idempotency-Key',
+    businessApiPassQuery: (process.env.BUSINESS_API_PASS_QUERY || 'true').trim().toLowerCase() !== 'false',
+    resourceWrapResponse: (process.env.RESOURCE_WRAP_RESPONSE || 'true').trim().toLowerCase() !== 'false',
+    resourceServiceType: (process.env.RESOURCE_SERVICE_TYPE || '').trim() || 'API_CALL',
+    bindPayload,
+    maxBodyBytes: Number(maxBodyRaw),
 
     /** 私钥来源，仅用于自检输出（不含任何密钥内容） */
     privateKeySource: priv.source,

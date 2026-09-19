@@ -14,7 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { STATUS, DEFAULT_CONFIRM_LEASE_MS, isoNow } = require('./contract');
+const { STATUS, DEFAULT_CONFIRM_LEASE_MS, DEFAULT_GENERATE_LEASE_MS, isoNow } = require('./contract');
 
 class JsonFileOrderRepository {
   /** @param {{filePath?: string}} [opts] */
@@ -75,7 +75,7 @@ class JsonFileOrderRepository {
     return this.orders.get(outTradeNo) || null;
   }
 
-  async create({ outTradeNo, resourceId, amount, payBefore, goodsName, currency = 'CNY' }) {
+  async create({ outTradeNo, resourceId, amount, payBefore, goodsName, currency = 'CNY', payloadFingerprint = null }) {
     return this._serial(() => {
       if (this.orders.has(outTradeNo)) {
         throw new Error(`订单号重复：${outTradeNo}`);
@@ -90,10 +90,12 @@ class JsonFileOrderRepository {
         status: STATUS.PENDING,
         trade_no: null,
         service_result: null,
+        payload_fingerprint: payloadFingerprint,
         created_at: isoNow(),
         paid_at: null,
         fulfilled_at: null,
         confirm_lease_until: null,
+        generate_lease_until: null,
       };
       this.orders.set(outTradeNo, order);
       this._persistSync();
@@ -102,42 +104,68 @@ class JsonFileOrderRepository {
   }
 
   /**
-   * 两阶段履约第一步：原子占位并只生成一次资源。
-   * PENDING/PAID → 生成资源 → PENDING_CONFIRM
-   * PENDING_CONFIRM / FULFILLED → 复用已落库资源，绝不重新生成
+   * 认领资源生成权（快、原子、锁内不做 I/O）
+   *
+   * 返回 state：
+   *   NOT_FOUND       订单不存在
+   *   FULFILLED       已闭环，serviceResult 为已落库资源
+   *   PENDING_CONFIRM 资源已生成待回执，serviceResult 为已落库资源
+   *   CLAIMED         本次获得生成权 —— 调用方需在锁外生成资源，
+   *                   然后调用 storeFulfillmentResult 落库
+   *   IN_PROGRESS     他人正在生成，稍后重试或等待
+   *
+   * @returns {Promise<{state:string, order:object|null, serviceResult:string|null}>}
    */
-  async prepareFulfillment({ outTradeNo, tradeNo, createResource }) {
+  async claimFulfillmentGeneration({ outTradeNo, leaseMs = DEFAULT_GENERATE_LEASE_MS }) {
     return this._serial(() => {
       const order = this.orders.get(outTradeNo);
-      if (!order) {
-        return { order: null, state: null, serviceResult: null, alreadyFulfilled: false };
-      }
+      if (!order) return { state: 'NOT_FOUND', order: null, serviceResult: null };
 
       if (order.status === STATUS.FULFILLED) {
-        return {
-          order,
-          state: STATUS.FULFILLED,
-          serviceResult: order.service_result ?? null,
-          alreadyFulfilled: true,
-        };
+        return { state: STATUS.FULFILLED, order, serviceResult: order.service_result ?? null };
       }
-
       if (order.status === STATUS.PENDING_CONFIRM) {
-        return {
-          order,
-          state: STATUS.PENDING_CONFIRM,
-          serviceResult: order.service_result ?? null,
-          alreadyFulfilled: false,
-        };
+        return { state: STATUS.PENDING_CONFIRM, order, serviceResult: order.service_result ?? null };
       }
 
-      const serviceResult = createResource();
-      order.service_result = serviceResult;
+      const lease = order.generate_lease_until ? Date.parse(order.generate_lease_until) : 0;
+      if (Number.isFinite(lease) && lease > Date.now()) {
+        return { state: 'IN_PROGRESS', order, serviceResult: null };
+      }
+
+      order.generate_lease_until = new Date(Date.now() + leaseMs).toISOString();
+      this._persistSync();
+      return { state: 'CLAIMED', order, serviceResult: null };
+    });
+  }
+
+  /** 资源生成完成 → 落库并进入 PENDING_CONFIRM */
+  async storeFulfillmentResult({ outTradeNo, tradeNo, serviceResult }) {
+    return this._serial(() => {
+      const order = this.orders.get(outTradeNo);
+      if (!order) return null;
+
+      // 已有资源则不覆盖（幂等：重复生成也只认第一份）
+      if (order.service_result === null || order.service_result === undefined) {
+        order.service_result = serviceResult;
+      }
       order.status = STATUS.PENDING_CONFIRM;
+      order.generate_lease_until = null;
       order.trade_no = tradeNo || order.trade_no;
       order.paid_at = order.paid_at || isoNow();
       this._persistSync();
-      return { order, state: STATUS.PENDING_CONFIRM, serviceResult, alreadyFulfilled: false };
+      return order;
+    });
+  }
+
+  /** 资源生成失败 → 释放生成权，订单留在原状态等待重试 */
+  async releaseFulfillmentGeneration({ outTradeNo }) {
+    return this._serial(() => {
+      const order = this.orders.get(outTradeNo);
+      if (!order) return null;
+      order.generate_lease_until = null;
+      this._persistSync();
+      return order;
     });
   }
 

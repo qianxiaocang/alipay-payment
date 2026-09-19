@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS aipay_orders (
        status         VARCHAR(24)   NOT NULL,
        trade_no       VARCHAR(64)   NULL,
        service_result TEXT          NULL,
+       payload_fingerprint  CHAR(64) NULL,
+       generate_lease_until TIMESTAMPTZ NULL,
        confirm_lease_until TIMESTAMPTZ NULL,
        confirm_attempts    INTEGER NOT NULL DEFAULT 0,
        fulfillment_confirm_ok       BOOLEAN      NULL,

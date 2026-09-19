@@ -125,6 +125,10 @@ info(`金额     : ${config.amount} ${config.currency}`);
 info(`截止时间 : ${config.payBeforeMinutes} 分钟`);
 info(`资源路径 : ${config.resourcePath}`);
 info(`商品名称 : ${config.goodsName}`);
+info(`资源来源 : ${config.resourceProvider}${config.resourceProvider === 'api'
+  ? `（${config.businessApiMethod} ${config.businessApiUrl}）`
+  : '（占位内容，未接入真实业务）'}`);
+info(`载荷绑定 : ${config.bindPayload ? '开启' : '关闭'}`);
 info(`网关     : ${config.gateway}`);
 info(`私钥来源 : ${config.privateKeySource}`);
 info(`公钥来源 : ${config.publicKeySource}`);
@@ -216,6 +220,18 @@ if (config.validateResponseSign === true) {
   ok('网关响应验签已开启，且不存在可关闭的开关');
 } else {
   bad('响应验签未开启 —— 违反「支付校验无旁路」要求');
+}
+
+if (config.resourceProvider === 'static') {
+  warn('资源来源为 static（占位内容）—— 上线前必须切到 RESOURCE_PROVIDER=api 并配置 BUSINESS_API_URL');
+} else {
+  ok(`资源来源为业务 API：${config.businessApiMethod} ${config.businessApiUrl}`);
+}
+
+if (!config.bindPayload && config.resourceProvider === 'api') {
+  bad('载荷绑定已关闭且使用业务 API —— 存在「低价付款、高价调用」风险，必须开启');
+} else if (config.bindPayload) {
+  ok('已开启载荷绑定（防低价付款、高价调用）');
 }
 
 if (config.storeDriver === 'json') {

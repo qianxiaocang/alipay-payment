@@ -149,23 +149,30 @@ test('真库契约测试（需 TEST_DB_DIALECT，未设置则跳过）', { skip:
     // ---- 唯一约束
     await assert.rejects(() => repo.create({ outTradeNo: id1, ...base }), /订单号重复/);
 
-    // ---- prepareFulfillment 只生成一次（并发）
-    let calls = 0;
-    const createResource = () => { calls += 1; return `RES_${calls}`; };
-    const prepared = await Promise.all(
-      Array.from({ length: 8 }, () =>
-        repo.prepareFulfillment({ outTradeNo: id1, tradeNo: 'T1', createResource }),
-      ),
+    // ---- 生成认领：并发下只有一个 CLAIMED（跨实例互斥的核心）
+    const genClaims = await Promise.all(
+      Array.from({ length: 8 }, () => repo.claimFulfillmentGeneration({ outTradeNo: id1 })),
     );
-    assert.equal(calls, 1, '并发下资源只能生成一次');
-    assert.ok(prepared.every((p) => p.serviceResult === 'RES_1'));
-    assert.equal((await repo.get(id1)).status, STATUS.PENDING_CONFIRM);
+    assert.equal(genClaims.filter((c) => c.state === 'CLAIMED').length, 1, '只能有一个生成者');
+    assert.equal(genClaims.filter((c) => c.state === 'IN_PROGRESS').length, 7, '其余应看到进行中');
+
+    // ---- 生成并落库
+    await repo.storeFulfillmentResult({ outTradeNo: id1, tradeNo: 'T1', serviceResult: 'RES_1' });
+    const generated = await repo.get(id1);
+    assert.equal(generated.status, STATUS.PENDING_CONFIRM);
+    assert.equal(generated.service_result, 'RES_1');
+    assert.equal(generated.generate_lease_until, null, '落库后应释放生成租约');
+
+    // ---- 再次认领应复用已落库资源，不重新生成
+    const reuse = await repo.claimFulfillmentGeneration({ outTradeNo: id1 });
+    assert.equal(reuse.state, STATUS.PENDING_CONFIRM);
+    assert.equal(reuse.serviceResult, 'RES_1');
 
     // ---- 回执认领：只有一个成功
-    const claims = await Promise.all(
+    const confirmClaims = await Promise.all(
       Array.from({ length: 8 }, () => repo.claimFulfillmentConfirm({ outTradeNo: id1 })),
     );
-    assert.equal(claims.filter(Boolean).length, 1, '同一时刻只能有一个执行者认领');
+    assert.equal(confirmClaims.filter(Boolean).length, 1, '同一时刻只能有一个执行者认领');
 
     // ---- 失败释放后留在 PENDING_CONFIRM 且可再认领
     await repo.releaseFulfillmentClaim({ outTradeNo: id1, code: '40004', subCode: 'SYSTEM_ERROR' });
@@ -174,11 +181,6 @@ test('真库契约测试（需 TEST_DB_DIALECT，未设置则跳过）', { skip:
     assert.equal(afterRelease.fulfillment_confirm.ok, false);
     assert.equal(await repo.claimFulfillmentConfirm({ outTradeNo: id1 }), true);
 
-    // ---- 重试不得重新生成资源
-    const retried = await repo.prepareFulfillment({ outTradeNo: id1, tradeNo: 'T1', createResource });
-    assert.equal(calls, 1, '重试不得重新生成资源');
-    assert.equal(retried.serviceResult, 'RES_1');
-
     // ---- 闭环
     await repo.completeFulfillment({ outTradeNo: id1, tradeNo: 'T1' });
     const closed = await repo.get(id1);
@@ -186,15 +188,17 @@ test('真库契约测试（需 TEST_DB_DIALECT，未设置则跳过）', { skip:
     assert.equal(closed.fulfillment_confirm.ok, true);
     assert.ok(closed.fulfilled_at);
 
-    // ---- 已闭环后不再生成
-    const afterClosed = await repo.prepareFulfillment({ outTradeNo: id1, tradeNo: 'T1', createResource });
-    assert.equal(afterClosed.alreadyFulfilled, true);
-    assert.equal(calls, 1);
+    // ---- 已闭环后不再生成、不再认领
+    const afterClosed = await repo.claimFulfillmentGeneration({ outTradeNo: id1 });
+    assert.equal(afterClosed.state, STATUS.FULFILLED);
+    assert.equal(afterClosed.serviceResult, 'RES_1');
+    assert.equal(await repo.claimFulfillmentConfirm({ outTradeNo: id1 }), false);
 
     // ---- 补偿列表能捞出停在 PENDING_CONFIRM 的订单
     const id2 = mk();
     await repo.create({ outTradeNo: id2, ...base });
-    await repo.prepareFulfillment({ outTradeNo: id2, tradeNo: 'T2', createResource: () => 'R2' });
+    await repo.claimFulfillmentGeneration({ outTradeNo: id2 });
+    await repo.storeFulfillmentResult({ outTradeNo: id2, tradeNo: 'T2', serviceResult: 'R2' });
     const pending = await repo.listPendingFulfillmentConfirm(500);
     assert.ok(
       pending.some((o) => o.out_trade_no === id2),

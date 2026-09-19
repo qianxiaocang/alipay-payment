@@ -3,7 +3,7 @@
 /**
  * JsonFileOrderRepository 契约测试
  *
- * 这里验证的是 contract.js 定义的语义，而不是实现细节 ——
+ * 验证 contract.js 定义的服务端语义，而不是实现细节 ——
  * SQL 实现（sql.js）应满足同一组语义。
  */
 
@@ -26,7 +26,26 @@ async function newRepo(filePath = ':memory:') {
   return repo;
 }
 
-const base = { resourceId: '/r', amount: '0.01', payBefore: '2026-04-15T12:00:00+08:00', goodsName: 'g' };
+const base = {
+  resourceId: '/r',
+  amount: '0.01',
+  payBefore: '2026-04-15T12:00:00+08:00',
+  goodsName: 'g',
+};
+
+/**
+ * 走完「认领 → 生成 → 落库」，返回生成结果。
+ * 模拟 flow 层与仓储的真实交互顺序（生成发生在锁外）。
+ */
+async function fulfill(repo, outTradeNo, tradeNo, createResource) {
+  const claim = await repo.claimFulfillmentGeneration({ outTradeNo });
+  if (claim.state !== 'CLAIMED') {
+    return { state: claim.state, serviceResult: claim.serviceResult, generated: false };
+  }
+  const serviceResult = createResource();
+  await repo.storeFulfillmentResult({ outTradeNo, tradeNo, serviceResult });
+  return { state: STATUS.PENDING_CONFIRM, serviceResult, generated: true };
+}
 
 // ================================================================ 基本读写
 
@@ -40,9 +59,16 @@ test('create / get 往返，初始状态为 PENDING', async () => {
   assert.equal(order.amount, '0.01');
   assert.equal(order.currency, 'CNY');
   assert.equal(order.service_result, null);
+  assert.equal(order.payload_fingerprint, null);
   assert.ok(order.created_at);
 
   assert.equal(await repo.get('NOPE'), null);
+});
+
+test('create 可记录载荷指纹', async () => {
+  const repo = await newRepo();
+  await repo.create({ outTradeNo: 'F', ...base, payloadFingerprint: 'abc123' });
+  assert.equal((await repo.get('F')).payload_fingerprint, 'abc123');
 });
 
 test('重复订单号必须失败（唯一性约束）', async () => {
@@ -59,93 +85,115 @@ test('size 反映订单数', async () => {
   assert.equal(await repo.size(), 2);
 });
 
-// ================================================================ 两阶段履约
+// ================================================================ 资源生成认领
 
-test('prepareFulfillment 首次生成资源并进入 PENDING_CONFIRM', async () => {
+test('首次认领返回 CLAIMED，落库后转为 PENDING_CONFIRM', async () => {
   const repo = await newRepo();
-  await repo.create({ outTradeNo: 'P1', ...base });
+  await repo.create({ outTradeNo: 'G1', ...base });
 
-  let calls = 0;
-  const res = await repo.prepareFulfillment({
-    outTradeNo: 'P1',
-    tradeNo: 'T1',
-    createResource: () => { calls += 1; return 'CONTENT'; },
-  });
+  const claim = await repo.claimFulfillmentGeneration({ outTradeNo: 'G1' });
+  assert.equal(claim.state, 'CLAIMED');
 
-  assert.equal(calls, 1);
-  assert.equal(res.state, STATUS.PENDING_CONFIRM);
-  assert.equal(res.serviceResult, 'CONTENT');
-  assert.equal(res.alreadyFulfilled, false);
+  await repo.storeFulfillmentResult({ outTradeNo: 'G1', tradeNo: 'T1', serviceResult: 'CONTENT' });
 
-  const order = await repo.get('P1');
+  const order = await repo.get('G1');
   assert.equal(order.status, STATUS.PENDING_CONFIRM);
   assert.equal(order.service_result, 'CONTENT');
   assert.equal(order.trade_no, 'T1');
-  assert.ok(order.paid_at, '首次履约应记录 paid_at');
+  assert.equal(order.generate_lease_until, null, '落库后应释放生成租约');
+  assert.ok(order.paid_at);
 });
 
-test('prepareFulfillment 重复调用复用资源，绝不重新生成', async () => {
+test('生成租约未过期时，他人认领得到 IN_PROGRESS', async () => {
   const repo = await newRepo();
-  await repo.create({ outTradeNo: 'P2', ...base });
+  await repo.create({ outTradeNo: 'G2', ...base });
 
-  let calls = 0;
-  const createResource = () => { calls += 1; return `C${calls}`; };
-
-  await repo.prepareFulfillment({ outTradeNo: 'P2', tradeNo: 'T', createResource });
-  const second = await repo.prepareFulfillment({ outTradeNo: 'P2', tradeNo: 'T', createResource });
-  const third = await repo.prepareFulfillment({ outTradeNo: 'P2', tradeNo: 'T', createResource });
-
-  assert.equal(calls, 1, '资源生成函数只能被调用一次');
-  assert.equal(second.serviceResult, 'C1');
-  assert.equal(third.serviceResult, 'C1');
-  assert.equal(third.state, STATUS.PENDING_CONFIRM);
+  assert.equal((await repo.claimFulfillmentGeneration({ outTradeNo: 'G2', leaseMs: 60000 })).state, 'CLAIMED');
+  assert.equal((await repo.claimFulfillmentGeneration({ outTradeNo: 'G2' })).state, 'IN_PROGRESS');
 });
 
-test('prepareFulfillment 并发下只生成一次资源', async () => {
+test('生成租约过期后可被接管（持有者崩溃恢复）', async () => {
   const repo = await newRepo();
-  await repo.create({ outTradeNo: 'P3', ...base });
+  await repo.create({ outTradeNo: 'G3', ...base });
 
-  let calls = 0;
-  const createResource = () => { calls += 1; return `C${calls}`; };
+  assert.equal((await repo.claimFulfillmentGeneration({ outTradeNo: 'G3', leaseMs: 1 })).state, 'CLAIMED');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(
+    (await repo.claimFulfillmentGeneration({ outTradeNo: 'G3' })).state,
+    'CLAIMED',
+    '租约过期后应可被接管',
+  );
+});
+
+test('releaseFulfillmentGeneration 释放生成权以便重试', async () => {
+  const repo = await newRepo();
+  await repo.create({ outTradeNo: 'G4', ...base });
+
+  await repo.claimFulfillmentGeneration({ outTradeNo: 'G4', leaseMs: 60000 });
+  assert.equal((await repo.claimFulfillmentGeneration({ outTradeNo: 'G4' })).state, 'IN_PROGRESS');
+
+  await repo.releaseFulfillmentGeneration({ outTradeNo: 'G4' });
+  assert.equal(
+    (await repo.claimFulfillmentGeneration({ outTradeNo: 'G4' })).state,
+    'CLAIMED',
+    '释放后应可立即重新认领',
+  );
+});
+
+test('并发认领只有一个 CLAIMED', async () => {
+  const repo = await newRepo();
+  await repo.create({ outTradeNo: 'G5', ...base });
 
   const results = await Promise.all(
-    Array.from({ length: 25 }, () =>
-      repo.prepareFulfillment({ outTradeNo: 'P3', tradeNo: 'T', createResource }),
-    ),
+    Array.from({ length: 25 }, () => repo.claimFulfillmentGeneration({ outTradeNo: 'G5' })),
   );
-
-  assert.equal(calls, 1, '并发下资源生成函数只能被调用一次');
-  assert.ok(results.every((r) => r.serviceResult === 'C1'));
+  assert.equal(results.filter((r) => r.state === 'CLAIMED').length, 1);
+  assert.equal(results.filter((r) => r.state === 'IN_PROGRESS').length, 24);
 });
 
-test('已 FULFILLED 后 prepareFulfillment 返回 alreadyFulfilled 且不再生成', async () => {
+test('storeFulfillmentResult 不覆盖已落库资源（幂等）', async () => {
   const repo = await newRepo();
-  await repo.create({ outTradeNo: 'P4', ...base });
-  await repo.prepareFulfillment({ outTradeNo: 'P4', tradeNo: 'T', createResource: () => 'C' });
-  await repo.completeFulfillment({ outTradeNo: 'P4', tradeNo: 'T' });
+  await repo.create({ outTradeNo: 'G6', ...base });
+  await fulfill(repo, 'G6', 'T', () => 'FIRST');
+
+  await repo.storeFulfillmentResult({ outTradeNo: 'G6', tradeNo: 'T', serviceResult: 'SECOND' });
+  assert.equal((await repo.get('G6')).service_result, 'FIRST');
+});
+
+test('已生成资源后再次认领直接复用，不再触发生成', async () => {
+  const repo = await newRepo();
+  await repo.create({ outTradeNo: 'G7', ...base });
 
   let calls = 0;
-  const res = await repo.prepareFulfillment({
-    outTradeNo: 'P4',
-    tradeNo: 'T',
-    createResource: () => { calls += 1; return 'NEW'; },
-  });
+  const createResource = () => { calls += 1; return `C${calls}`; };
 
+  const first = await fulfill(repo, 'G7', 'T', createResource);
+  const second = await fulfill(repo, 'G7', 'T', createResource);
+
+  assert.equal(calls, 1, '资源生成只能发生一次');
+  assert.equal(first.serviceResult, 'C1');
+  assert.equal(second.state, STATUS.PENDING_CONFIRM);
+  assert.equal(second.serviceResult, 'C1');
+  assert.equal(second.generated, false);
+});
+
+test('已 FULFILLED 后认领返回 FULFILLED 且不再生成', async () => {
+  const repo = await newRepo();
+  await repo.create({ outTradeNo: 'G8', ...base });
+  await fulfill(repo, 'G8', 'T', () => 'RES');
+  await repo.claimFulfillmentConfirm({ outTradeNo: 'G8' });
+  await repo.completeFulfillment({ outTradeNo: 'G8', tradeNo: 'T' });
+
+  let calls = 0;
+  const res = await fulfill(repo, 'G8', 'T', () => { calls += 1; return 'NEW'; });
   assert.equal(res.state, STATUS.FULFILLED);
-  assert.equal(res.alreadyFulfilled, true);
-  assert.equal(res.serviceResult, 'C');
+  assert.equal(res.serviceResult, 'RES');
   assert.equal(calls, 0);
 });
 
-test('prepareFulfillment 对不存在的订单返回空结果', async () => {
+test('认领不存在的订单返回 NOT_FOUND', async () => {
   const repo = await newRepo();
-  const res = await repo.prepareFulfillment({
-    outTradeNo: 'NOPE',
-    tradeNo: 'T',
-    createResource: () => 'C',
-  });
-  assert.equal(res.order, null);
-  assert.equal(res.state, null);
+  assert.equal((await repo.claimFulfillmentGeneration({ outTradeNo: 'NOPE' })).state, 'NOT_FOUND');
 });
 
 // ================================================================ 回执认领
@@ -153,7 +201,7 @@ test('prepareFulfillment 对不存在的订单返回空结果', async () => {
 test('claimFulfillmentConfirm 同一时刻只有一个执行者能拿到', async () => {
   const repo = await newRepo();
   await repo.create({ outTradeNo: 'C1', ...base });
-  await repo.prepareFulfillment({ outTradeNo: 'C1', tradeNo: 'T', createResource: () => 'R' });
+  await fulfill(repo, 'C1', 'T', () => 'R');
 
   const results = await Promise.all(
     Array.from({ length: 10 }, () => repo.claimFulfillmentConfirm({ outTradeNo: 'C1' })),
@@ -167,21 +215,20 @@ test('未处于 PENDING_CONFIRM 时不可认领', async () => {
   assert.equal(await repo.claimFulfillmentConfirm({ outTradeNo: 'C2' }), false, 'PENDING 态不可认领');
 });
 
-test('租约未过期时不可被抢占', async () => {
+test('回执租约未过期时不可被抢占', async () => {
   const repo = await newRepo();
   await repo.create({ outTradeNo: 'C3', ...base });
-  await repo.prepareFulfillment({ outTradeNo: 'C3', tradeNo: 'T', createResource: () => 'R' });
+  await fulfill(repo, 'C3', 'T', () => 'R');
 
   assert.equal(await repo.claimFulfillmentConfirm({ outTradeNo: 'C3', leaseMs: 60000 }), true);
   assert.equal(await repo.claimFulfillmentConfirm({ outTradeNo: 'C3' }), false, '租约期内不可抢占');
 });
 
-test('租约过期后可被抢占（崩溃恢复）', async () => {
+test('回执租约过期后可被抢占（崩溃恢复）', async () => {
   const repo = await newRepo();
   await repo.create({ outTradeNo: 'C4', ...base });
-  await repo.prepareFulfillment({ outTradeNo: 'C4', tradeNo: 'T', createResource: () => 'R' });
+  await fulfill(repo, 'C4', 'T', () => 'R');
 
-  // 用一个极短租约模拟持有者崩溃
   assert.equal(await repo.claimFulfillmentConfirm({ outTradeNo: 'C4', leaseMs: 1 }), true);
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(await repo.claimFulfillmentConfirm({ outTradeNo: 'C4' }), true, '租约过期后应可抢占');
@@ -190,7 +237,7 @@ test('租约过期后可被抢占（崩溃恢复）', async () => {
 test('completeFulfillment 闭环并记录成功回执', async () => {
   const repo = await newRepo();
   await repo.create({ outTradeNo: 'C5', ...base });
-  await repo.prepareFulfillment({ outTradeNo: 'C5', tradeNo: 'T', createResource: () => 'R' });
+  await fulfill(repo, 'C5', 'T', () => 'R');
   await repo.claimFulfillmentConfirm({ outTradeNo: 'C5' });
 
   const order = await repo.completeFulfillment({ outTradeNo: 'C5', tradeNo: 'T' });
@@ -204,17 +251,20 @@ test('completeFulfillment 闭环并记录成功回执', async () => {
 test('releaseFulfillmentClaim 释放认领并留在 PENDING_CONFIRM', async () => {
   const repo = await newRepo();
   await repo.create({ outTradeNo: 'C6', ...base });
-  await repo.prepareFulfillment({ outTradeNo: 'C6', tradeNo: 'T', createResource: () => 'R' });
+  await fulfill(repo, 'C6', 'T', () => 'R');
   await repo.claimFulfillmentConfirm({ outTradeNo: 'C6' });
-  await repo.releaseFulfillmentClaim({ outTradeNo: 'C6', code: '40004', subCode: 'SYSTEM_ERROR', subMsg: '系统繁忙' });
+  await repo.releaseFulfillmentClaim({
+    outTradeNo: 'C6',
+    code: '40004',
+    subCode: 'SYSTEM_ERROR',
+    subMsg: '系统繁忙',
+  });
 
   const order = await repo.get('C6');
   assert.equal(order.status, STATUS.PENDING_CONFIRM, '失败后必须留在可重试态');
   assert.equal(order.fulfillment_confirm.ok, false);
   assert.equal(order.fulfillment_confirm.sub_code, 'SYSTEM_ERROR');
   assert.equal(order.confirm_lease_until, null, '失败后应释放租约以便重试');
-
-  // 释放后可再次认领
   assert.equal(await repo.claimFulfillmentConfirm({ outTradeNo: 'C6' }), true);
 });
 
@@ -224,12 +274,13 @@ test('listPendingFulfillmentConfirm 捞出停在 PENDING_CONFIRM 的订单', asy
   const repo = await newRepo();
   await repo.create({ outTradeNo: 'L1', ...base });
   await repo.create({ outTradeNo: 'L2', ...base });
-  await repo.prepareFulfillment({ outTradeNo: 'L1', tradeNo: 'T', createResource: () => 'R' });
+  await fulfill(repo, 'L1', 'T', () => 'R');
 
   const pending = await repo.listPendingFulfillmentConfirm();
   assert.equal(pending.length, 1);
   assert.equal(pending[0].out_trade_no, 'L1');
 
+  await repo.claimFulfillmentConfirm({ outTradeNo: 'L1' });
   await repo.completeFulfillment({ outTradeNo: 'L1', tradeNo: 'T' });
   assert.equal((await repo.listPendingFulfillmentConfirm()).length, 0);
 });
@@ -242,7 +293,8 @@ test('订单跨实例可恢复，且幂等状态保持', async () => {
   const r1 = new JsonFileOrderRepository({ filePath: file });
   await r1.init();
   await r1.create({ outTradeNo: 'X1', ...base });
-  await r1.prepareFulfillment({ outTradeNo: 'X1', tradeNo: 'T9', createResource: () => 'RES' });
+  await fulfill(r1, 'X1', 'T9', () => 'RES');
+  await r1.claimFulfillmentConfirm({ outTradeNo: 'X1' });
   await r1.completeFulfillment({ outTradeNo: 'X1', tradeNo: 'T9' });
 
   const r2 = new JsonFileOrderRepository({ filePath: file });
@@ -255,11 +307,7 @@ test('订单跨实例可恢复，且幂等状态保持', async () => {
 
   // 恢复后依然不能重复生成资源
   let calls = 0;
-  const res = await r2.prepareFulfillment({
-    outTradeNo: 'X1',
-    tradeNo: 'T9',
-    createResource: () => { calls += 1; return 'NEW'; },
-  });
+  const res = await fulfill(r2, 'X1', 'T9', () => { calls += 1; return 'NEW'; });
   assert.equal(calls, 0);
   assert.equal(res.serviceResult, 'RES');
 });

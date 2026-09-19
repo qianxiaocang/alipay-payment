@@ -30,6 +30,13 @@ const ERR = {
    */
   RESOURCE_ID_MISSING: 'RESOURCE_ID_MISSING',
   AMOUNT_MISMATCH: 'AMOUNT_MISMATCH',
+  /**
+   * 二次请求的内容与下单时不一致。
+   *
+   * 用于「API 按次付费」防「低价付款、高价调用」：402 协议不承载载荷哈希，
+   * 因此服务端在返回 402 时记录请求指纹，二次请求时比对。
+   */
+  PAYLOAD_MISMATCH: 'PAYLOAD_MISMATCH',
   VERIFY_FAILED: 'VERIFY_FAILED',
   FULFILLMENT_CONFIRM_FAILED: 'FULFILLMENT_CONFIRM_FAILED',
 };

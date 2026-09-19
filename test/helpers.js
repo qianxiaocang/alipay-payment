@@ -49,8 +49,26 @@ function makeConfig(overrides = {}) {
     validateResponseSign: false, // 测试替身不产生真实响应签名
     storePath: ':memory:',
     storeDriver: 'json',
+    db: null,
+    dbTable: 'aipay_orders',
     confirmLeaseMs: 30000,
     confirmWaitMs: 2000,
+    generateLeaseMs: 60000,
+
+    // 资源 provider（默认占位实现；测试通常直接注入 generateResource）
+    resourceProvider: 'static',
+    businessApiUrl: null,
+    businessApiMethod: 'POST',
+    businessApiTimeoutMs: 15000,
+    businessApiAuthHeader: null,
+    businessApiAuthValue: null,
+    businessApiIdempotencyHeader: 'Idempotency-Key',
+    businessApiPassQuery: true,
+    resourceWrapResponse: true,
+    resourceServiceType: 'API_CALL',
+
+    bindPayload: true,
+    maxBodyBytes: 1048576,
 
     privateKeySource: 'TEST_KEY',
     publicKeySource: 'TEST_KEY',

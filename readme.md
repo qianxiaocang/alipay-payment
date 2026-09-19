@@ -12,6 +12,7 @@
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [订单存储](#订单存储)
+- [业务资源：你卖什么](#业务资源你卖什么)
 - [测试](#测试)
 - [上线检查清单](#上线检查清单)
 - [安全红线](#安全红线)
@@ -157,6 +158,100 @@ npm run check-config
 
 ---
 
+## 业务资源：你卖什么
+
+`resource_id` 是「卖的是什么」的身份标识，而**买家付完钱实际拿到什么**由
+`src/resource.js` 决定。本仓库面向 **API 按次付费**，提供两种 provider：
+
+| provider | 行为 | 用途 |
+| --- | --- | --- |
+| `static`（默认） | 返回占位内容 | 仅跑通链路 |
+| `api` | 把买家的请求转发给你自己的业务 API，响应作为付费内容返回 | **生产** |
+
+### 接入你的业务 API
+
+```bash
+RESOURCE_PROVIDER=api
+BUSINESS_API_URL=https://your-internal-api.example.com/paid-endpoint
+BUSINESS_API_METHOD=POST
+BUSINESS_API_TIMEOUT_MS=15000
+BUSINESS_API_AUTH_HEADER=Authorization
+BUSINESS_API_AUTH_VALUE=Bearer <your-token>
+BUSINESS_API_IDEMPOTENCY_HEADER=Idempotency-Key
+```
+
+服务做的事：
+
+1. 把买家的 `method` / `query` / `body` 转发到 `BUSINESS_API_URL`
+2. 带上你的鉴权头，以及**幂等键 = `out_trade_no`**（防止上游被重复调用）
+3. 上游非 2xx、超时、或返回空内容 → **抛错**，订单留在可重试态，**不上报履约回执**
+4. 成功则把响应包一层可归属元数据后返回：
+
+```json
+{
+  "status": "success",
+  "service_type": "API_CALL",
+  "resource_id": "/demo/a2m/resource",
+  "out_trade_no": "ORDER_...",
+  "trade_no": "2026...",
+  "upstream_status": 200,
+  "data": { "你的业务 API 原始返回": "..." },
+  "generated_at": "2026-04-15T12:54:37+08:00"
+}
+```
+
+不想要这层包裹就设 `RESOURCE_WRAP_RESPONSE=false`，直接返回上游原文。
+
+**安全**：只转发 `content-type` / `accept` 与你的鉴权头，
+**绝不转发 `Payment-Proof` / `Payment-Validation`** 给业务 API。
+
+### ⚠️ 载荷绑定：防「低价付款、高价调用」
+
+这是「API 按次付费」特有的攻击面：
+
+```
+1. 攻击者发一个便宜/无害的请求  → 拿到 402 → 付款 0.01
+2. 带着同一份 Payment-Proof 重放一个完全不同、成本高得多的请求
+3. 凭证是有效的 —— 没有绑定就会被放行，等于用 0.01 买了高价调用
+```
+
+402 协议本身**没有**可承载载荷哈希的字段，所以绑定只能在服务端做：
+返回 402 时记录请求指纹（method + path + query + body 的 SHA-256），
+二次请求时比对，不一致返回 `409 PAYLOAD_MISMATCH`。
+
+- 由 `RESOURCE_BIND_PAYLOAD` 控制，**默认开启**，用 `api` provider 时不要关
+- 指纹会规范化 JSON 键顺序，语义相同、写法不同的请求不会误判
+- 只纳入 method/path/query/body，不含 headers（避免买家 CLI 因 UA 等差异误判）
+- `MAX_BODY_BYTES` 同时是**单次调用的成本上界**，按业务设定
+
+### ⚠️ 资源生成是慢操作，所以拆成三步
+
+`api` provider 要调用外部 HTTP，可能数秒。早期实现是「持锁期间生成资源」，
+那会让 JSON 实现阻塞整个服务、让 SQL 实现长期占住行锁与连接池。现在拆为：
+
+```
+认领（快、原子）→ 生成（慢、锁外）→ 落库（快、原子）
+```
+
+租约（`GENERATE_LEASE_MS`）保证同一订单只有一个执行者真的去调业务 API，
+持有者崩溃后超时可由其它实例接管。
+
+### 替换成别的形态
+
+如果你卖的不是「转发到内部 API」，而是大模型生成、文件下载、license 发放等，
+照着 `src/resource.js` 里 `createApiProvider` 的形状写一个 provider 即可：
+
+```js
+async function myProvider({ resourceId, outTradeNo, tradeNo, request }) {
+  // 必须幂等：同一订单只应产生一次副作用
+  // 失败要抛异常：否则会被当成"已交付"并上报回执
+  // 不能返回空：清单要求非空可归属资源
+  return JSON.stringify({ /* 买家买到的东西 */ });
+}
+```
+
+---
+
 ## 测试
 
 ```bash
@@ -172,10 +267,11 @@ npm test
 | `test/signing.test.js` | 签名串拼接、Base64URL、ISO 8601 时区、RSA2 签名验签 |
 | `test/paymentNeeded.test.js` | 402 载荷分层结构、字段完备性、签名可验签性 |
 | `test/config.test.js` | 配置校验、PKCS#1/PKCS#8 识别、默认项强制、网关限制、清单缺口回归 |
-| `test/repositoryJsonFile.test.js` | 仓储契约：持久化、原子写入、两阶段履约、回执认领与租约 |
+| `test/repositoryJsonFile.test.js` | 仓储契约：持久化、原子写入、生成认领、回执认领与租约 |
+| `test/resourceProvider.test.js` | 请求指纹、业务 API 转发、鉴权与幂等键、不泄露支付头、超时/非 2xx/空响应 |
 | `test/repositorySql.test.js` | 方言适配、迁移文件一致性；真库契约测试（需 `TEST_DB_DIALECT`） |
 | `test/flow.test.js` | 两个场景全流程 + 各类拒绝分支 + 并发防重放 |
-| `test/twoPhaseFulfillment.test.js` | 资源标识强校验、并发幂等、回执失败重试补发 |
+| `test/twoPhaseFulfillment.test.js` | 资源标识强校验、载荷绑定、异步生成、回执失败重试补发 |
 | `test/server.test.js` | HTTP 层、响应头、日志脱敏 |
 | `test/gatewayFallback.test.js` | 无签名响应降级、未验签成功拒绝采信 |
 
@@ -205,6 +301,9 @@ node --test test/repositorySql.test.js
 - [ ] 支付宝公钥填的是**支付宝公钥**，不是应用公钥（自检脚本会检测填反）
 - [ ] `ALIPAY_AMOUNT` 与入驻时该 `service-id` 的价格一致
 - [ ] `ALIPAY_GATEWAY` 为生产网关（本实现仅支持生产网关，不含沙箱分支）
+- [ ] `RESOURCE_PROVIDER=api` 且 `BUSINESS_API_URL` 指向真实业务接口（不能停留在 `static` 占位）
+- [ ] `RESOURCE_BIND_PAYLOAD` 保持开启（用 `api` provider 时关闭会造成低价套利）
+- [ ] `MAX_BODY_BYTES` 已按业务设定（它同时是单次调用的成本上界）
 - [ ] 首次真实联调建议先用最小金额（`0.01`），确认无误后再调回真实价格
 
 ### 服务器时区 ⚠️
@@ -405,6 +504,23 @@ AI 收的 `pay_before` 用 **ISO 8601 带时区偏移**（如 `2026-04-15T12:54:
 会直接跳过防串校验。官方文档明确要求「生产环境必须把资源字段缺失当作异常处理」。
 现已改为硬失败（`RESOURCE_ID_MISSING`，502），空串与仅空白也视为缺失。
 
+### 9. 「API 按次付费」特有的低价套利口子（本实现已封堵）
+
+402 协议**没有**可承载请求载荷哈希的字段 —— Payment-Needed 里没有它的位置，
+Payment-Proof 也不回传。这带来一个协议层面的缺口：
+
+1. 攻击者发一个便宜/无害的请求 → 拿到 402 → 付款 0.01
+2. 带着同一份 Payment-Proof 重放一个完全不同的、成本高得多的请求
+3. 凭证有效，没有绑定就会被放行 —— **用 0.01 买了高价调用**
+
+本实现的对策：返回 402 时记录请求指纹（method + path + query + body 的 SHA-256），
+二次请求时比对，不一致返回 `409 PAYLOAD_MISMATCH` 且不执行生成。
+指纹对 JSON 键顺序不敏感，只纳入 method/path/query/body（不含 headers，
+避免买家 CLI 因 UA 等无关差异误判）。
+
+对「API 按次付费」这是必开项，由 `RESOURCE_BIND_PAYLOAD` 控制（默认开启）。
+
+
 ---
 
 ## 运维
@@ -528,7 +644,7 @@ location /demo/a2m/resource {
 | 日志 | 极简 console 封装 | 换 pino/winston，接入日志采集 |
 | 限流 | 无 | 资源接口加限流，防止凭证暴力尝试 |
 | 监控 | 无 | 对 402 转化率、校验失败率、回执失败率、`PENDING_CONFIRM` 堆积做监控告警 |
-| 资源生成 | `src/resource.js` 占位实现 | 替换为真实业务逻辑 |
+| 资源生成 | `static` 占位 / `api` 转发业务 API | 已支持「API 按次付费」；其它形态照 `createApiProvider` 写一个 provider |
 | 回执补偿 | 提供 `listPendingFulfillmentConfirm()` | 加定时任务补发停在 `PENDING_CONFIRM` 的订单 |
 | 对账 | 订单已存 `trade_no` / 金额 / 时间 | 定期与支付宝账单核对 |
 

@@ -4,8 +4,8 @@
  * SQL 订单仓储（MySQL / PostgreSQL）
  *
  * 适用：多实例生产部署。相比 JSON 文件实现，它提供真正的跨实例原子性：
- *   · prepareFulfillment      —— 事务 + SELECT ... FOR UPDATE 行锁，
- *                                跨实例保证资源只生成一次
+ *   · claimFulfillmentGeneration —— 事务 + SELECT ... FOR UPDATE 行锁 + 生成租约，
+ *                                跨实例保证只有一人去调业务 API
  *   · claimFulfillmentConfirm —— 原子 UPDATE + 租约，跨实例保证回执只上报一次
  *   · 唯一主键                —— out_trade_no 重复插入必然失败
  *
@@ -21,6 +21,7 @@ const {
   STATUS,
   STATUS_VALUES,
   DEFAULT_CONFIRM_LEASE_MS,
+  DEFAULT_GENERATE_LEASE_MS,
   isoNow,
 } = require('./contract');
 
@@ -37,6 +38,8 @@ const SCHEMA = {
        status         VARCHAR(24)   NOT NULL,
        trade_no       VARCHAR(64)   NULL,
        service_result MEDIUMTEXT    NULL,
+       payload_fingerprint  CHAR(64) NULL,
+       generate_lease_until DATETIME(3) NULL,
        confirm_lease_until DATETIME(3) NULL,
        confirm_attempts    INT NOT NULL DEFAULT 0,
        fulfillment_confirm_ok       TINYINT(1)   NULL,
@@ -63,6 +66,8 @@ const SCHEMA = {
        status         VARCHAR(24)   NOT NULL,
        trade_no       VARCHAR(64)   NULL,
        service_result TEXT          NULL,
+       payload_fingerprint  CHAR(64) NULL,
+       generate_lease_until TIMESTAMPTZ NULL,
        confirm_lease_until TIMESTAMPTZ NULL,
        confirm_attempts    INTEGER NOT NULL DEFAULT 0,
        fulfillment_confirm_ok       BOOLEAN      NULL,
@@ -98,6 +103,7 @@ class SqlOrderRepository {
     this.connection = opts.connection || {};
     this.table = opts.table || 'aipay_orders';
     this.confirmLeaseMs = opts.confirmLeaseMs || DEFAULT_CONFIRM_LEASE_MS;
+    this.generateLeaseMs = opts.generateLeaseMs || DEFAULT_GENERATE_LEASE_MS;
     this.autoMigrate = opts.autoMigrate !== false;
     this.pool = null;
   }
@@ -239,6 +245,8 @@ class SqlOrderRepository {
       paid_at: this._toIso(row.paid_at),
       fulfilled_at: this._toIso(row.fulfilled_at),
       confirm_lease_until: this._toIso(row.confirm_lease_until),
+      generate_lease_until: this._toIso(row.generate_lease_until),
+      payload_fingerprint: row.payload_fingerprint ?? null,
       confirm_attempts: row.confirm_attempts ?? 0,
       fulfillment_confirm: attempts === null || attempts === undefined
         ? undefined
@@ -254,13 +262,15 @@ class SqlOrderRepository {
 
   // ------------------------------------------------------------ 接口实现
 
-  async create({ outTradeNo, resourceId, amount, payBefore, goodsName, currency = 'CNY' }) {
+  async create({ outTradeNo, resourceId, amount, payBefore, goodsName, currency = 'CNY', payloadFingerprint = null }) {
     try {
       await this._raw(
         `INSERT INTO ${this.table}
-           (out_trade_no, resource_id, amount, currency, goods_name, pay_before, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [outTradeNo, resourceId, amount, currency, goodsName, payBefore, STATUS.PENDING, new Date()],
+           (out_trade_no, resource_id, amount, currency, goods_name, pay_before, status,
+            payload_fingerprint, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [outTradeNo, resourceId, amount, currency, goodsName, payBefore, STATUS.PENDING,
+          payloadFingerprint, new Date()],
       );
     } catch (err) {
       // 唯一主键冲突 → 明确的重复订单语义（并发下也只会有一个成功）
@@ -278,10 +288,16 @@ class SqlOrderRepository {
   }
 
   /**
-   * 两阶段履约第一步：事务内加行锁，保证资源只生成一次。
-   * createResource 在持锁期间执行 —— 与官方参考实现语义一致。
+   * 认领资源生成权：事务 + 行锁（快，锁内不做 I/O）
+   *
+   * 注意：这里**不**在持锁期间调用业务 API。资源生成对「API 按次付费」是慢操作
+   * （可能数秒），持锁做 I/O 会长期占住行锁与连接池。因此拆为：
+   *   认领（本方法）→ 生成（调用方，锁外）→ storeFulfillmentResult 落库
+   *
+   * @returns {Promise<{state:string, order:object|null, serviceResult:string|null}>}
+   *   NOT_FOUND | FULFILLED | PENDING_CONFIRM | CLAIMED | IN_PROGRESS
    */
-  async prepareFulfillment({ outTradeNo, tradeNo, createResource }) {
+  async claimFulfillmentGeneration({ outTradeNo, leaseMs = this.generateLeaseMs }) {
     return this._tx(async (conn) => {
       const { rows } = await this._exec(
         conn,
@@ -289,44 +305,54 @@ class SqlOrderRepository {
         [outTradeNo],
       );
       const row = rows[0];
-      if (!row) {
-        return { order: null, state: null, serviceResult: null, alreadyFulfilled: false };
-      }
+      if (!row) return { state: 'NOT_FOUND', order: null, serviceResult: null };
 
       const order = this._map(row);
 
       if (order.status === STATUS.FULFILLED) {
-        return {
-          order,
-          state: STATUS.FULFILLED,
-          serviceResult: order.service_result,
-          alreadyFulfilled: true,
-        };
+        return { state: STATUS.FULFILLED, order, serviceResult: order.service_result };
       }
-
       if (order.status === STATUS.PENDING_CONFIRM) {
-        return {
-          order,
-          state: STATUS.PENDING_CONFIRM,
-          serviceResult: order.service_result,
-          alreadyFulfilled: false,
-        };
+        return { state: STATUS.PENDING_CONFIRM, order, serviceResult: order.service_result };
       }
 
-      const serviceResult = createResource();
+      const lease = order.generate_lease_until ? Date.parse(order.generate_lease_until) : 0;
+      if (Number.isFinite(lease) && lease > Date.now()) {
+        return { state: 'IN_PROGRESS', order, serviceResult: null };
+      }
+
       await this._exec(
         conn,
-        `UPDATE ${this.table}
-            SET status = ?, service_result = ?,
-                trade_no = COALESCE(?, trade_no),
-                paid_at  = COALESCE(paid_at, ?)
-          WHERE out_trade_no = ?`,
-        [STATUS.PENDING_CONFIRM, serviceResult, tradeNo || null, new Date(), outTradeNo],
+        `UPDATE ${this.table} SET generate_lease_until = ? WHERE out_trade_no = ?`,
+        [new Date(Date.now() + leaseMs), outTradeNo],
       );
-
-      const updated = await this.get(outTradeNo);
-      return { order: updated, state: STATUS.PENDING_CONFIRM, serviceResult, alreadyFulfilled: false };
+      return { state: 'CLAIMED', order, serviceResult: null };
     });
+  }
+
+  /** 资源生成完成 → 落库并进入 PENDING_CONFIRM（已有资源不覆盖） */
+  async storeFulfillmentResult({ outTradeNo, tradeNo, serviceResult }) {
+    const now = new Date();
+    await this._raw(
+      `UPDATE ${this.table}
+          SET status = ?,
+              service_result = COALESCE(service_result, ?),
+              generate_lease_until = NULL,
+              trade_no = COALESCE(?, trade_no),
+              paid_at = COALESCE(paid_at, ?)
+        WHERE out_trade_no = ?`,
+      [STATUS.PENDING_CONFIRM, serviceResult, tradeNo || null, now, outTradeNo],
+    );
+    return this.get(outTradeNo);
+  }
+
+  /** 资源生成失败 → 释放生成权，订单留在原状态等待重试 */
+  async releaseFulfillmentGeneration({ outTradeNo }) {
+    await this._raw(
+      `UPDATE ${this.table} SET generate_lease_until = NULL WHERE out_trade_no = ?`,
+      [outTradeNo],
+    );
+    return this.get(outTradeNo);
   }
 
   /**

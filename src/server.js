@@ -14,6 +14,7 @@
 
 const express = require('express');
 const { handleResourceRequest } = require('./paymentFlow');
+const { fromExpressRequest } = require('./requestContext');
 
 /** 敏感字段掩码：任何进入日志的对象都先过一遍 */
 const SENSITIVE_KEYS = /private|secret|public_key|publickey|payment_proof|client_session|signature/i;
@@ -58,8 +59,22 @@ function createApp({ config, sdk, repository, logger = createLogger(), generateR
     res.json({ status: 'ok', orders: await repository.size() });
   });
 
-  app.get(config.resourcePath, async (req, res) => {
+  // 统一按原始字节收取请求体：
+  //   - 指纹计算需要「内容本身」，不能是已被解析/重排的对象
+  //   - 「API 按次付费」要把买家的 body 原样转发给业务 API
+  const captureRawBody = express.raw({ type: () => true, limit: config.maxBodyBytes });
+
+  const ALLOWED_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+
+  app.all(config.resourcePath, captureRawBody, async (req, res) => {
     const started = Date.now();
+
+    if (!ALLOWED_METHODS.includes(req.method)) {
+      res.set('Allow', ALLOWED_METHODS.join(', '));
+      res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: '不支持的请求方法' });
+      return;
+    }
+
     try {
       const result = await handleResourceRequest({
         paymentProofHeader: req.get('Payment-Proof'),
@@ -67,6 +82,7 @@ function createApp({ config, sdk, repository, logger = createLogger(), generateR
         sdk,
         repository,
         resourceId: config.resourcePath,
+        requestContext: fromExpressRequest(req),
         generateResource,
         logger,
       });

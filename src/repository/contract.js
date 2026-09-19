@@ -18,7 +18,7 @@
  *
  * 实现必须保证的原子性：
  *   1. create            —— out_trade_no 唯一，重复创建必须失败
- *   2. prepareFulfillment —— 同一订单的 createResource 只被调用一次
+ *   2. claimFulfillmentGeneration —— 同一订单同一时刻只有一个执行者获得生成权
  *                            （并发/多实例下也不能重复生成资源）
  *   3. claimFulfillmentConfirm —— 同一订单同一时刻只有一个执行者能上报回执
  *                            （跨实例），租约到期自动可被抢占
@@ -56,9 +56,28 @@ const STATUS_VALUES = Object.values(STATUS);
 /** 回执认领租约默认时长：超过则视为持有者已崩溃，允许他人抢占 */
 const DEFAULT_CONFIRM_LEASE_MS = 30000;
 
+/**
+ * 资源生成认领租约默认时长。
+ *
+ * 为什么资源生成也要租约：
+ *   「API 按次付费」的资源生成 = 调用后端业务 API，是**慢操作**（可能数秒）。
+ *   如果像早期实现那样在持有锁/事务期间做这件事，JSON 实现会阻塞整个服务，
+ *   SQL 实现会长期占住行锁与连接。因此拆成：
+ *     认领（快、原子）→ 生成（慢、在锁外）→ 落库（快、原子）
+ *   租约保证「同一订单只有一个执行者真的去调业务 API」，
+ *   且持有者崩溃后过期可被接管。
+ */
+const DEFAULT_GENERATE_LEASE_MS = 60000;
+
 /** 统一的时间表示：ISO 8601 字符串，便于 JSON 与 SQL 两种实现共用 */
 function isoNow() {
   return new Date().toISOString();
 }
 
-module.exports = { STATUS, STATUS_VALUES, DEFAULT_CONFIRM_LEASE_MS, isoNow };
+module.exports = {
+  STATUS,
+  STATUS_VALUES,
+  DEFAULT_CONFIRM_LEASE_MS,
+  DEFAULT_GENERATE_LEASE_MS,
+  isoNow,
+};

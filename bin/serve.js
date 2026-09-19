@@ -11,6 +11,7 @@
 const { loadConfig, ConfigError } = require('../src/config');
 const { createAlipayClient } = require('../src/alipayClient');
 const { createOrderRepository } = require('../src/repository');
+const { createResourceProvider } = require('../src/resource');
 const { createApp, createLogger } = require('../src/server');
 
 async function main() {
@@ -35,7 +36,17 @@ async function main() {
   const repository = createOrderRepository(config);
   await repository.init();
 
-  const app = createApp({ config, sdk, repository, logger });
+  // 业务资源生成器：static（占位）或 api（转发到你的业务 API）
+  let generateResource;
+  try {
+    generateResource = createResourceProvider(config);
+  } catch (err) {
+    logger.error('资源生成器初始化失败：%s', err.message);
+    await repository.close().catch(() => {});
+    process.exit(1);
+  }
+
+  const app = createApp({ config, sdk, repository, generateResource, logger });
 
   const server = app.listen(config.port, () => {
     logger.info('AI 收服务已启动');

@@ -246,3 +246,164 @@ test('金额字段为空时跳过金额比对，但资源校验仍生效', async
   const res = await pay(config, store, sdk);
   assert.equal(res.status, 200);
 });
+
+// ================================================================ 载荷绑定
+
+/** 带请求上下文发起首次请求 */
+function initiateWith(config, store, sdk, requestContext) {
+  return handleResourceRequest({
+    paymentProofHeader: undefined,
+    config,
+    sdk,
+    repository: store,
+    resourceId: config.resourcePath,
+    requestContext,
+    logger: silentLogger,
+  });
+}
+
+/** 带请求上下文发起二次请求 */
+function payWithContext(config, store, sdk, requestContext, generateResource) {
+  return handleResourceRequest({
+    paymentProofHeader: makeProofHeader(),
+    config,
+    sdk,
+    repository: store,
+    resourceId: config.resourcePath,
+    requestContext,
+    generateResource,
+    logger: silentLogger,
+  });
+}
+
+const CTX = {
+  method: 'POST',
+  path: '/demo/a2m/resource',
+  query: { lang: 'zh' },
+  body: '{"prompt":"summarize this"}',
+};
+
+test('载荷绑定：二次请求内容不同 → 409 PAYLOAD_MISMATCH，不执行', async () => {
+  const { config, store } = await setup();
+  const sdk = new FakeSdk();
+
+  const first = await initiateWith(config, store, sdk, CTX);
+  assert.equal(first.status, 402);
+  sdk.verifyResponse = paidResponse(first.body.out_trade_no);
+
+  let generated = false;
+  const res = await payWithContext(
+    config,
+    store,
+    sdk,
+    // 付款后偷换成完全不同的（可能昂贵得多的）请求
+    { ...CTX, body: '{"prompt":"totally different expensive job"}' },
+    async () => { generated = true; return 'SHOULD_NOT_HAPPEN'; },
+  );
+
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, 'PAYLOAD_MISMATCH');
+  assert.equal(generated, false, '内容不一致时绝不能执行资源生成');
+  assert.equal(sdk.countCalls('alipay.aipay.agent.fulfillment.confirm'), 0);
+});
+
+test('载荷绑定：内容一致（仅 JSON 键顺序不同）→ 正常履约', async () => {
+  const { config, store } = await setup();
+  const sdk = new FakeSdk();
+
+  const first = await initiateWith(config, store, sdk, { ...CTX, body: '{"a":1,"b":2}' });
+  sdk.verifyResponse = paidResponse(first.body.out_trade_no);
+
+  const res = await payWithContext(
+    config,
+    store,
+    sdk,
+    { ...CTX, body: '{"b":2,"a":1}' }, // 同语义、不同键序
+    async () => 'RESULT',
+  );
+
+  assert.equal(res.status, 200, '语义相同不应被误判');
+  assert.equal(res.body.content, 'RESULT');
+});
+
+test('载荷绑定：query 变化也会被拦下', async () => {
+  const { config, store } = await setup();
+  const sdk = new FakeSdk();
+
+  const first = await initiateWith(config, store, sdk, CTX);
+  sdk.verifyResponse = paidResponse(first.body.out_trade_no);
+
+  const res = await payWithContext(config, store, sdk, { ...CTX, query: { lang: 'en' } }, async () => 'X');
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, 'PAYLOAD_MISMATCH');
+});
+
+test('载荷绑定：关闭时不校验', async () => {
+  const { config, store } = await setup({ bindPayload: false });
+  const sdk = new FakeSdk();
+
+  const first = await initiateWith(config, store, sdk, CTX);
+  sdk.verifyResponse = paidResponse(first.body.out_trade_no);
+
+  const res = await payWithContext(config, store, sdk, { ...CTX, body: '{"changed":true}' }, async () => 'R');
+  assert.equal(res.status, 200);
+});
+
+// ================================================================ 异步资源生成
+
+test('异步资源生成器被正确 await 并落库', async () => {
+  const { config, store } = await setup();
+  const sdk = new FakeSdk();
+
+  const first = await initiate(config, store, sdk);
+  sdk.verifyResponse = paidResponse(first.body.out_trade_no);
+
+  let done = false;
+  const res = await pay(config, store, sdk, async () => {
+    await new Promise((r) => setTimeout(r, 30)); // 模拟调用业务 API
+    done = true;
+    return 'ASYNC_RESULT';
+  });
+
+  assert.equal(done, true, '必须等待异步生成器完成');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.content, 'ASYNC_RESULT');
+  assert.equal((await store.get(first.body.out_trade_no)).service_result, 'ASYNC_RESULT');
+});
+
+test('异步资源生成器抛错 → 500，订单可重试且不上报回执', async () => {
+  const { config, store } = await setup();
+  const sdk = new FakeSdk();
+
+  const first = await initiate(config, store, sdk);
+  const outTradeNo = first.body.out_trade_no;
+  sdk.verifyResponse = paidResponse(outTradeNo);
+
+  const res = await pay(config, store, sdk, async () => {
+    throw new Error('业务 API 超时');
+  });
+
+  assert.equal(res.status, 500);
+  assert.equal(res.body.code, 'FULFILLMENT_ERROR');
+  assert.equal(sdk.countCalls('alipay.aipay.agent.fulfillment.confirm'), 0, '生成失败不得上报回执');
+  assert.equal((await store.get(outTradeNo)).generate_lease_until, null, '失败后应释放生成权');
+
+  // 释放后可重试成功
+  sdk.confirmResponse = { code: '10000', msg: 'Success' };
+  const retry = await pay(config, store, sdk, async () => 'RETRY_OK');
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.content, 'RETRY_OK');
+});
+
+test('资源生成返回空内容 → 500（清单要求非空可归属资源）', async () => {
+  const { config, store } = await setup();
+  const sdk = new FakeSdk();
+
+  const first = await initiate(config, store, sdk);
+  sdk.verifyResponse = paidResponse(first.body.out_trade_no);
+
+  const res = await pay(config, store, sdk, async () => '');
+  assert.equal(res.status, 500);
+  assert.equal(res.body.code, 'FULFILLMENT_ERROR');
+  assert.equal(sdk.countCalls('alipay.aipay.agent.fulfillment.confirm'), 0);
+});
