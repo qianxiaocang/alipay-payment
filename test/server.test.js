@@ -4,21 +4,21 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createApp, redact, createLogger } = require('../src/server');
-const { OrderStore } = require('../src/store');
+const { JsonFileOrderRepository } = require('../src/repository');
 const { makeConfig, makeProofHeader, FakeSdk } = require('./helpers');
 const { base64UrlDecode } = require('../src/signing');
 
 /** 启动一个临时服务器，返回 baseUrl 与关闭函数 */
 async function withServer(fn, { configOverrides } = {}) {
   const config = makeConfig(configOverrides);
-  const store = new OrderStore({ filePath: ':memory:' });
+  const store = new JsonFileOrderRepository({ filePath: ':memory:' });
   await store.init();
   const sdk = new FakeSdk();
 
   const app = createApp({
     config,
     sdk,
-    store,
+    repository: store,
     logger: { info() {}, warn() {}, error() {} },
   });
 
@@ -80,7 +80,7 @@ test('HTTP：带凭证的完整链路返回 200 与 Payment-Validation 头', asy
     const body = await res.json();
     assert.equal(body.already_fulfilled, false);
     assert.ok(body.content, '应返回资源内容');
-    assert.equal(store.get(firstBody.out_trade_no).status, 'FULFILLED');
+    assert.equal((await store.get(firstBody.out_trade_no)).status, 'FULFILLED');
   });
 });
 

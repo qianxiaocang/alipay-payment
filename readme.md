@@ -11,6 +11,7 @@
 - [一分钟了解流程](#一分钟了解流程)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
+- [订单存储](#订单存储)
 - [测试](#测试)
 - [上线检查清单](#上线检查清单)
 - [安全红线](#安全红线)
@@ -109,6 +110,53 @@ ALIPAY_PUBLIC_KEY_FILE=/etc/alipay/alipay_public_key.pem
 
 ---
 
+## 订单存储
+
+业务代码只依赖仓储契约（`src/repository/contract.js`），换存储不用改业务逻辑。
+
+| 驱动 | 适用 | 跨实例互斥 | 配置 |
+| --- | --- | --- | --- |
+| `json`（默认） | 单实例、本地开发、首笔验证 | ❌ 仅进程内 | `ORDER_STORE_PATH` |
+| `mysql` | 多实例生产 | ✅ 行锁 + 唯一约束 + 租约 | `DB_*` |
+| `postgres` | 多实例生产 | ✅ 同上 | `DB_*` |
+
+> ⚠️ **`json` 驱动只能单实例部署。** 它的互斥是进程内的，两个实例同时收到同一笔
+> 凭证时无法互相排斥，会导致重复上报履约回执。横向扩容**必须**先切数据库。
+
+### 切到数据库
+
+```bash
+# 1. 装驱动（已列为 optionalDependencies，通常随 npm install 一起装上）
+npm install mysql2     # 或 npm install pg
+
+# 2. 建表（也可让服务启动时自动建表，默认 autoMigrate=true）
+mysql -h HOST -u USER -p DBNAME < src/repository/migrations/mysql.sql
+psql  -h HOST -U USER -d DBNAME -f src/repository/migrations/postgres.sql
+
+# 3. 改配置
+ORDER_STORE_DRIVER=postgres
+DB_HOST=...  DB_PORT=5432  DB_USER=...  DB_PASSWORD=...  DB_NAME=...
+
+# 4. 自检会真实连库验证
+npm run check-config
+```
+
+迁移脚本由 `src/repository/sql.js` 的 `SCHEMA` 生成，有测试保证两者不漂移。
+
+### 关键控制如何在各实现中落地
+
+| 控制 | json 实现 | SQL 实现 |
+| --- | --- | --- |
+| 订单唯一 | Map key 判重 | 主键唯一约束（`ER_DUP_ENTRY` / `23505`） |
+| 资源只生成一次 | 串行队列 + 状态判断 | 事务 + `SELECT ... FOR UPDATE` 行锁 |
+| 回执只上报一次 | 串行队列 + 持久化租约 | 原子 `UPDATE` + 租约（`confirm_lease_until`） |
+| 崩溃恢复 | 租约到期可抢占 | 同左 |
+
+租约（`CONFIRM_LEASE_MS`，默认 30s）解决「持有者上报途中崩溃」：超时后其它实例
+可以接管上报，不会永久卡死。
+
+---
+
 ## 测试
 
 ```bash
@@ -123,11 +171,25 @@ npm test
 | --- | --- |
 | `test/signing.test.js` | 签名串拼接、Base64URL、ISO 8601 时区、RSA2 签名验签 |
 | `test/paymentNeeded.test.js` | 402 载荷分层结构、字段完备性、签名可验签性 |
-| `test/config.test.js` | 配置校验、PKCS#1/PKCS#8 识别、默认项强制、网关限制 |
-| `test/store.test.js` | 订单持久化、原子写入、并发幂等 |
+| `test/config.test.js` | 配置校验、PKCS#1/PKCS#8 识别、默认项强制、网关限制、清单缺口回归 |
+| `test/repositoryJsonFile.test.js` | 仓储契约：持久化、原子写入、两阶段履约、回执认领与租约 |
+| `test/repositorySql.test.js` | 方言适配、迁移文件一致性；真库契约测试（需 `TEST_DB_DIALECT`） |
 | `test/flow.test.js` | 两个场景全流程 + 各类拒绝分支 + 并发防重放 |
+| `test/twoPhaseFulfillment.test.js` | 资源标识强校验、并发幂等、回执失败重试补发 |
 | `test/server.test.js` | HTTP 层、响应头、日志脱敏 |
 | `test/gatewayFallback.test.js` | 无签名响应降级、未验签成功拒绝采信 |
+
+### 跑真库契约测试
+
+SQL 实现的原子性（行锁、唯一约束、租约）只有真库能验证：
+
+```bash
+TEST_DB_DIALECT=postgres TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=5432 \
+TEST_DB_USER=aipay TEST_DB_PASSWORD=secret TEST_DB_NAME=aipay_test \
+node --test test/repositorySql.test.js
+```
+
+未设置 `TEST_DB_DIALECT` 时该用例自动跳过，其余测试照常运行。
 
 > ⚠️ 测试通过只代表**代码逻辑**正确。真实链路必须用最小金额
 > 在真实环境验证一次（沙箱流程见[沙箱、以及第一笔真实交易](#沙箱以及第一笔真实交易)）。
@@ -176,7 +238,9 @@ TZ=Asia/Shanghai
 ### 业务幂等
 
 - [ ] 替换 `src/resource.js` 为你自己的业务逻辑，并确认**同一订单重复调用无副作用**
-- [ ] 订单存储已替换为数据库/Redis（多实例部署时必须，见[生产化建议](#生产化建议)）
+- [ ] 多实例部署已切换为 `mysql`/`postgres` 驱动（`json` 驱动**不支持多实例**）
+- [ ] 已配置回执补偿定时任务，处理停在 `PENDING_CONFIRM` 的订单
+- [ ] 数据库账号权限最小化（仅该表 DML），并已配置备份
 
 ---
 
@@ -373,10 +437,15 @@ for (const order of pending) {
 
 ### 并发与幂等边界
 
-- **进程内**：同一订单的「履约 + 回执」由 `store.withOrderLock()` 互斥，
-  并发携带同一凭证只会生成一次资源、只上报一次回执
-- **多实例**：进程内锁失效，必须改用分布式锁，并以数据库唯一约束
-  作为幂等的最终保证（见「生产化建议」）
+| 场景 | 保证方式 |
+| --- | --- |
+| 单实例并发同一凭证 | 资源只生成一次、回执只上报一次（JSON 串行队列 / SQL 行锁） |
+| **多实例**并发同一凭证 | **必须**用 `mysql`/`postgres` 驱动：`SELECT ... FOR UPDATE` + 回执租约原子认领 |
+| 持有者上报途中崩溃 | 租约（`CONFIRM_LEASE_MS`）到期后其它实例可接管，不会永久卡死 |
+| 重复携带同一凭证 | 复用已落库资源，返回 `already_fulfilled: true`，不重复交付 |
+
+> `json` 驱动的互斥是**进程内**的。多实例部署时两个进程无法互相排斥，
+> 会导致同一笔交易被重复上报履约回执 —— 这是切数据库的核心理由。
 
 ### 接口错误码
 
@@ -454,13 +523,14 @@ location /demo/a2m/resource {
 
 | 项 | 现状 | 建议 |
 | --- | --- | --- |
-| 订单存储 | JSON 文件（原子写入 + 串行化） | 多实例部署换 Redis/数据库，并以唯一索引作为幂等的最终保证 |
-| 履约互斥 | 进程内 `withOrderLock` | 多实例部署换分布式锁，否则并发重复请求可能重复上报回执 |
+| 订单存储 | `json` 单实例 / `mysql`·`postgres` 多实例 | 多实例部署**必须**切数据库（见[订单存储](#订单存储)） |
+| 履约互斥 | JSON 进程内租约 / SQL 行锁 + 租约 | 多实例必须用 SQL 驱动，否则并发重复请求可能重复上报回执 |
 | 日志 | 极简 console 封装 | 换 pino/winston，接入日志采集 |
 | 限流 | 无 | 资源接口加限流，防止凭证暴力尝试 |
 | 监控 | 无 | 对 402 转化率、校验失败率、回执失败率、`PENDING_CONFIRM` 堆积做监控告警 |
 | 资源生成 | `src/resource.js` 占位实现 | 替换为真实业务逻辑 |
-| 回执补偿 | 提供 `listPendingFulfillmentConfirm()` | 加定时任务补发停留在 `PENDING_CONFIRM` 的订单 |
+| 回执补偿 | 提供 `listPendingFulfillmentConfirm()` | 加定时任务补发停在 `PENDING_CONFIRM` 的订单 |
+| 对账 | 订单已存 `trade_no` / 金额 / 时间 | 定期与支付宝账单核对 |
 
 ---
 

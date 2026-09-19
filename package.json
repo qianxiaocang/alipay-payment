@@ -16,5 +16,9 @@
   "dependencies": {
     "alipay-sdk": "^4.14.0",
     "express": "^5.2.1"
+  },
+  "optionalDependencies": {
+    "mysql2": "^3.11.0",
+    "pg": "^8.13.0"
   }
 }

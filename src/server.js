@@ -45,17 +45,17 @@ function createLogger(stream = console) {
  * @param {object} args
  * @param {object} args.config
  * @param {import('alipay-sdk').AlipaySdk} args.sdk
- * @param {import('./store').OrderStore} args.store
+ * @param {import('./repository').JsonFileOrderRepository|import('./repository').SqlOrderRepository} args.repository
  * @param {object} [args.logger]
  * @param {(ctx:object)=>string} [args.generateResource]
  */
-function createApp({ config, sdk, store, logger = createLogger(), generateResource }) {
+function createApp({ config, sdk, repository, logger = createLogger(), generateResource }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', true);
 
-  app.get('/healthz', (req, res) => {
-    res.json({ status: 'ok', orders: store.size() });
+  app.get('/healthz', async (req, res) => {
+    res.json({ status: 'ok', orders: await repository.size() });
   });
 
   app.get(config.resourcePath, async (req, res) => {
@@ -65,7 +65,7 @@ function createApp({ config, sdk, store, logger = createLogger(), generateResour
         paymentProofHeader: req.get('Payment-Proof'),
         config,
         sdk,
-        store,
+        repository,
         resourceId: config.resourcePath,
         generateResource,
         logger,

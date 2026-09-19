@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { handleResourceRequest } = require('../src/paymentFlow');
-const { OrderStore } = require('../src/store');
+const { JsonFileOrderRepository } = require('../src/repository');
 const { base64UrlDecode, base64UrlEncode } = require('../src/signing');
 const { makeConfig, makeProofHeader, FakeSdk } = require('./helpers');
 
@@ -13,7 +13,7 @@ const silentLogger = { info() {}, warn() {}, error() {} };
 /** 建一个干净的 store + config */
 async function setup(configOverrides) {
   const config = makeConfig(configOverrides);
-  const store = new OrderStore({ filePath: ':memory:' });
+  const store = new JsonFileOrderRepository({ filePath: ':memory:' });
   await store.init();
   return { config, store };
 }
@@ -24,7 +24,7 @@ function initiate(config, store, sdk = new FakeSdk()) {
     paymentProofHeader: undefined,
     config,
     sdk,
-    store,
+    repository: store,
     resourceId: config.resourcePath,
     logger: silentLogger,
   });
@@ -36,7 +36,7 @@ function pay(config, store, sdk, header, resourceId) {
     paymentProofHeader: header,
     config,
     sdk,
-    store,
+    repository: store,
     resourceId: resourceId ?? config.resourcePath,
     logger: silentLogger,
   });
@@ -48,7 +48,7 @@ function payWith(config, store, sdk, header, generateResource) {
     paymentProofHeader: header,
     config,
     sdk,
-    store,
+    repository: store,
     resourceId: config.resourcePath,
     generateResource,
     logger: silentLogger,
@@ -86,7 +86,7 @@ test('场景一：无凭证 → 402 且返回合法 Payment-Needed，订单落�
   assert.equal(decoded.protocol.seller_sign_type, 'RSA2');
 
   // 订单必须落库，否则后续无法做资源校验与幂等
-  const order = store.get(res.body.out_trade_no);
+  const order = (await store.get(res.body.out_trade_no));
   assert.ok(order, '订单应已创建');
   assert.equal(order.status, 'PENDING');
   assert.equal(order.resource_id, config.resourcePath);
@@ -100,7 +100,7 @@ test('场景一：连续两次请求生成不同的订单号', async () => {
   const a = await initiate(config, store);
   const b = await initiate(config, store);
   assert.notEqual(a.body.out_trade_no, b.body.out_trade_no);
-  assert.equal(store.size(), 2);
+  assert.equal((await store.size()), 2);
 });
 
 // ================================================================ 场景二 · 成功
@@ -131,7 +131,7 @@ test('场景二：校验通过 → 200 + Payment-Validation + 履约回执上报
   // 履约回执必须上报
   assert.equal(sdk.countCalls('alipay.aipay.agent.fulfillment.confirm'), 1);
 
-  const order = store.get(outTradeNo);
+  const order = (await store.get(outTradeNo));
   assert.equal(order.status, 'FULFILLED');
   assert.equal(order.fulfillment_confirm.ok, true);
 });
@@ -240,7 +240,7 @@ test('场景二：active=false（凭证无效/过期）→ 400 且不履约', as
   assert.equal(res.status, 400);
   assert.equal(res.body.code, 'INVALID_PAYMENT_PROOF');
   assert.equal(sdk.countCalls('alipay.aipay.agent.fulfillment.confirm'), 0);
-  assert.equal(store.get(first.body.out_trade_no).status, 'PENDING');
+  assert.equal((await store.get(first.body.out_trade_no)).status, 'PENDING');
 });
 
 test('场景二：资源ID不匹配（资源串改）→ 403 且不履约', async () => {
@@ -396,7 +396,7 @@ test('履约回执上报失败 → 502，订单停在 PENDING_CONFIRM 且资源�
   assert.equal(res.status, 502);
   assert.equal(res.body.code, 'FULFILLMENT_CONFIRM_FAILED');
 
-  const order = store.get(outTradeNo);
+  const order = (await store.get(outTradeNo));
   assert.equal(order.status, 'PENDING_CONFIRM', '订单应停在待确认态以便重试');
   assert.equal(order.fulfillment_confirm.ok, false);
   assert.equal(order.fulfillment_confirm.sub_code, 'SYSTEM_ERROR');
@@ -404,7 +404,7 @@ test('履约回执上报失败 → 502，订单停在 PENDING_CONFIRM 且资源�
   assert.equal(generateCount, 1, '资源只应生成一次');
 
   // 补偿任务应能捞出
-  assert.equal(store.listPendingFulfillmentConfirm().length, 1);
+  assert.equal((await store.listPendingFulfillmentConfirm()).length, 1);
 
   // 用同一 Payment-Proof 重试 → 补发回执成功，且资源不重新生成
   sdk.confirmResponse = { code: '10000', msg: 'Success' };
@@ -414,8 +414,8 @@ test('履约回执上报失败 → 502，订单停在 PENDING_CONFIRM 且资源�
   assert.equal(retry.body.already_fulfilled, false);
   assert.equal(retry.body.content, 'RES_1', '重试必须复用首次生成的资源');
   assert.equal(generateCount, 1, '重试不得重新生成资源');
-  assert.equal(store.get(outTradeNo).status, 'FULFILLED');
-  assert.equal(store.listPendingFulfillmentConfirm().length, 0);
+  assert.equal((await store.get(outTradeNo)).status, 'FULFILLED');
+  assert.equal((await store.listPendingFulfillmentConfirm()).length, 0);
 });
 
 test('履约回执抛异常 → 502，且订单停在 PENDING_CONFIRM', async () => {
@@ -430,8 +430,8 @@ test('履约回执抛异常 → 502，且订单停在 PENDING_CONFIRM', async ()
 
   assert.equal(res.status, 502);
   assert.equal(res.body.code, 'FULFILLMENT_CONFIRM_FAILED');
-  assert.equal(store.get(first.body.out_trade_no).status, 'PENDING_CONFIRM');
-  assert.equal(store.get(first.body.out_trade_no).fulfillment_confirm.ok, false);
+  assert.equal((await store.get(first.body.out_trade_no)).status, 'PENDING_CONFIRM');
+  assert.equal((await store.get(first.body.out_trade_no)).fulfillment_confirm.ok, false);
 });
 
 // ================================================================ 业务资源
@@ -448,7 +448,7 @@ test('自定义资源生成器被调用，异常时返回 500 FULFILLMENT_ERROR'
     paymentProofHeader: makeProofHeader(),
     config,
     sdk,
-    store,
+    repository: store,
     resourceId: config.resourcePath,
     generateResource: () => {
       called = true;
@@ -471,7 +471,7 @@ test('自定义资源生成器被调用，异常时返回 500 FULFILLMENT_ERROR'
     paymentProofHeader: makeProofHeader(),
     config: c2,
     sdk: sdk2,
-    store: s2,
+    repository: s2,
     resourceId: c2.resourcePath,
     generateResource: () => {
       throw new Error('业务失败');
@@ -490,7 +490,7 @@ test('配置金额变化会体现在 402 响应与订单中', async () => {
   const res = await initiate(config, store);
 
   assert.equal(res.body.amount, '19.90');
-  assert.equal(store.get(res.body.out_trade_no).amount, '19.90');
+  assert.equal((await store.get(res.body.out_trade_no)).amount, '19.90');
 
   const decoded = JSON.parse(base64UrlDecode(res.headers['Payment-Needed']));
   assert.equal(decoded.protocol.amount, '19.90');

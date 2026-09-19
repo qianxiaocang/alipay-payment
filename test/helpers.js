@@ -48,6 +48,9 @@ function makeConfig(overrides = {}) {
     port: 3000,
     validateResponseSign: false, // 测试替身不产生真实响应签名
     storePath: ':memory:',
+    storeDriver: 'json',
+    confirmLeaseMs: 30000,
+    confirmWaitMs: 2000,
 
     privateKeySource: 'TEST_KEY',
     publicKeySource: 'TEST_KEY',

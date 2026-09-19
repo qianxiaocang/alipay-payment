@@ -128,8 +128,10 @@ info(`商品名称 : ${config.goodsName}`);
 info(`网关     : ${config.gateway}`);
 info(`私钥来源 : ${config.privateKeySource}`);
 info(`公钥来源 : ${config.publicKeySource}`);
-info(`订单存储 : ${config.storePath}`);
-info(`响应验签 : ${config.validateResponseSign ? '开启' : '关闭'}`);
+info(`订单存储 : ${config.storeDriver}${config.storeDriver === 'json'
+  ? `（${config.storePath}）`
+  : `（${config.db.host}:${config.db.port}/${config.db.database}）`}`);
+info('响应验签 : 恒定开启（不提供关闭开关）');
 
 // ---------------------------------------------------------------- 3. 密钥自测
 
@@ -209,11 +211,20 @@ try {
 
 section('[5] 上线风险提示');
 
-if (config.validateResponseSign !== true) {
-  warn('响应验签已关闭。生产环境建议开启 ALIPAY_VALIDATE_RESPONSE_SIGN=true');
+// 验签必须恒定开启（清单第一节「支付校验无旁路」）
+if (config.validateResponseSign === true) {
+  ok('网关响应验签已开启，且不存在可关闭的开关');
 } else {
-  ok('已开启网关响应验签');
+  bad('响应验签未开启 —— 违反「支付校验无旁路」要求');
 }
+
+if (config.storeDriver === 'json') {
+  ok('订单存储为持久化存储（json）');
+  warn('json 驱动使用进程内互斥，**只能单实例部署**；横向扩容前请切换为 mysql/postgres');
+} else {
+  ok(`订单存储为数据库（${config.storeDriver}），支持多实例`);
+}
+
 
 const amt = Number(config.amount);
 if (amt > 1) {
@@ -236,17 +247,54 @@ if (tzHours === 8) {
 const preview = new Date(Date.now() + config.payBeforeMinutes * 60 * 1000);
 info(`pay_before 预览：${formatIso8601WithTimezone(preview)}（当前时间 + ${config.payBeforeMinutes} 分钟）`);
 
-// ---------------------------------------------------------------- 结论
+// ---------------------------------------------------------------- 存储可用性
 
-console.log(`\n${C.bold}===== 自检结论 =====${C.reset}`);
-console.log(`通过 ${pass} 项，失败 ${fail} 项`);
+section('[6] 订单存储可用性');
 
-if (fail > 0) {
-  console.log(`\n${C.red}自检未通过，请先修复以下问题再启动服务：${C.reset}`);
-  failures.forEach((f, i) => console.log(`  ${i + 1}. ${f}`));
-  process.exit(1);
-}
+(async () => {
+  const { createOrderRepository } = require('../src/repository');
+  let repository = null;
 
-console.log(`\n${C.green}配置自检通过。${C.reset}`);
-console.log(`${C.yellow}⚠️  当前为生产配置：启动后每一笔请求都是真实交易。${C.reset}`);
-console.log('   建议：先阅读 README 的「上线检查清单」，并用最小金额完成首笔真实交易验证。');
+  if (config.storeDriver === 'json') {
+    try {
+      repository = createOrderRepository(config);
+      await repository.init();
+      const n = await repository.size();
+      ok(`json 存储可读写（当前 ${n} 条订单）：${config.storePath}`);
+    } catch (err) {
+      bad(`json 存储不可用：${err.message}`);
+    } finally {
+      if (repository) await repository.close().catch(() => {});
+    }
+  } else {
+    const target = `${config.db.host}:${config.db.port}/${config.db.database}`;
+    try {
+      repository = createOrderRepository(config);
+      await repository.init();
+      const n = await repository.size();
+      ok(`数据库连通且表结构就绪（当前 ${n} 条订单）：${target}`);
+      info(`表名：${config.dbTable}`);
+    } catch (err) {
+      bad(`数据库不可用：${err.message}`);
+      warn('→ 检查 DB_* 配置、网络连通性、账号权限；表不存在时会自动创建');
+    } finally {
+      if (repository) await repository.close().catch(() => {});
+    }
+  }
+
+  // ------------------------------------------------------------ 结论
+
+  console.log(`\n${C.bold}===== 自检结论 =====${C.reset}`);
+  console.log(`通过 ${pass} 项，失败 ${fail} 项`);
+
+  if (fail > 0) {
+    console.log(`\n${C.red}自检未通过，请先修复以下问题再启动服务：${C.reset}`);
+    failures.forEach((f, i) => console.log(`  ${i + 1}. ${f}`));
+    process.exit(1);
+  }
+
+  console.log(`\n${C.green}配置自检通过。${C.reset}`);
+  console.log(`${C.yellow}⚠️  当前为生产配置：启动后每一笔请求都是真实交易。${C.reset}`);
+  console.log('   建议：先阅读 README 的「上线检查清单」，并用最小金额完成首笔真实交易验证。');
+})();
+

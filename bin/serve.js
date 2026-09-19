@@ -10,7 +10,7 @@
 
 const { loadConfig, ConfigError } = require('../src/config');
 const { createAlipayClient } = require('../src/alipayClient');
-const { OrderStore } = require('../src/store');
+const { createOrderRepository } = require('../src/repository');
 const { createApp, createLogger } = require('../src/server');
 
 async function main() {
@@ -32,10 +32,10 @@ async function main() {
   }
 
   const sdk = createAlipayClient(config);
-  const store = new OrderStore({ filePath: config.storePath });
-  await store.init();
+  const repository = createOrderRepository(config);
+  await repository.init();
 
-  const app = createApp({ config, sdk, store, logger });
+  const app = createApp({ config, sdk, repository, logger });
 
   const server = app.listen(config.port, () => {
     logger.info('AI 收服务已启动');
@@ -48,12 +48,25 @@ async function main() {
     logger.info('  截止时间 : %d 分钟', config.payBeforeMinutes);
     logger.info('  私钥来源 : %s', config.privateKeySource);
     logger.info('  网关     : %s', config.gateway);
+    logger.info('  订单存储 : %s（%s）', config.storeDriver, config.storeDriver === 'json'
+      ? config.storePath
+      : `${config.db.host}:${config.db.port}/${config.db.database}`);
+    if (config.storeDriver === 'json') {
+      logger.warn('  单实例限制：json 存储不支持多实例部署，横向扩容前请切换为 mysql/postgres');
+    }
     logger.info('提示：当前为生产配置，以下每笔请求都是真实交易');
   });
 
   const shutdown = (signal) => {
     logger.info('收到 %s，正在优雅关闭…', signal);
-    server.close(() => process.exit(0));
+    server.close(async () => {
+      try {
+        await repository.close();
+      } catch (err) {
+        logger.warn('关闭订单存储失败：%s', err.message);
+      }
+      process.exit(0);
+    });
     setTimeout(() => process.exit(1), 10000).unref();
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));

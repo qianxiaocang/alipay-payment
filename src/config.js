@@ -225,6 +225,14 @@ function loadConfig(opts = {}) {
     throw new ConfigError(`商户ID 应为 2088 开头的纯数字，当前不符合（长度 ${sellerId.length}）`);
   }
 
+  // 清单第七节「AI 按量付费 serviceId 替换」：生产配置中不得保留 api_mock_service_id。
+  // 该值是沙箱联调专用占位，误带到生产会导致验付/履约对不上真实服务。
+  if (serviceId === 'api_mock_service_id') {
+    throw new ConfigError('serviceId 不得为 api_mock_service_id（沙箱专用占位值）', [
+      '请替换为服务市场注册/复用服务后实际返回的真实 serviceId',
+    ]);
+  }
+
   const amount = required('ALIPAY_AMOUNT', '收费金额', [
     '单位为元，字符串形式，需与入驻时的 service-id 价格一致',
   ]);
@@ -278,9 +286,71 @@ function loadConfig(opts = {}) {
   const resourcePath = (process.env.RESOURCE_PATH || '').trim() || '/demo/a2m/resource';
   if (!resourcePath.startsWith('/')) throw new ConfigError('RESOURCE_PATH 必须以 / 开头');
 
-  const validateResponseSign = (process.env.ALIPAY_VALIDATE_RESPONSE_SIGN || 'true').trim() !== 'false';
+  // 响应验签恒定开启。
+  //
+  // 这里刻意【不提供】关闭开关。官方《代码开发校验清单》第一节要求
+  // 「生产源码中不存在 Mock、测试或沙箱开关可触达的跳过验签、固定成功
+  // 或支付校验旁路」——一个可用环境变量关闭的验签开关正是这种旁路。
+  // 测试替身不走本函数（测试直接构造 config 对象），因此无需为此留口子。
+  const validateResponseSign = true;
 
   const storePath = (process.env.ORDER_STORE_PATH || '').trim() || path.join(ROOT, 'data', 'orders.json');
+
+  // 禁止生产使用内存存储。
+  // 清单第五节要求关键控制不得是「内存演示」；:memory: 会让订单持久化失效，
+  // 而 402 协议强依赖「付款前落库、携带凭证回来时能映射回本地订单」。
+  // 测试直接构造 JsonFileOrderRepository({filePath:':memory:'})，不经过本函数。
+  if (storePath === ':memory:') {
+    throw new ConfigError('ORDER_STORE_PATH 不允许为 :memory:（内存存储仅供测试使用）', [
+      '生产必须使用持久化存储（JSON 文件或数据库）',
+    ]);
+  }
+
+  // 订单仓储驱动：json（单实例）| mysql | postgres（多实例）
+  const storeDriver = ((process.env.ORDER_STORE_DRIVER || '').trim() || 'json').toLowerCase();
+  if (!['json', 'mysql', 'postgres'].includes(storeDriver)) {
+    throw new ConfigError(
+      `ORDER_STORE_DRIVER 必须为 json / mysql / postgres，当前为 ${storeDriver}`,
+    );
+  }
+
+  let db = null;
+  if (storeDriver !== 'json') {
+    const defaultPort = storeDriver === 'mysql' ? '3306' : '5432';
+    const host = (process.env.DB_HOST || '').trim();
+    const user = (process.env.DB_USER || '').trim();
+    const name = (process.env.DB_NAME || '').trim();
+    const password = process.env.DB_PASSWORD ?? '';
+    if (!host) throw new ConfigError('缺少必填配置 DB_HOST（使用数据库存储时）');
+    if (!user) throw new ConfigError('缺少必填配置 DB_USER（使用数据库存储时）');
+    if (!name) throw new ConfigError('缺少必填配置 DB_NAME（使用数据库存储时）');
+    if (!password) throw new ConfigError('缺少必填配置 DB_PASSWORD（使用数据库存储时）');
+
+    const portRaw = (process.env.DB_PORT || '').trim() || defaultPort;
+    if (!/^\d+$/.test(portRaw)) throw new ConfigError(`DB_PORT 应为数字，当前：${portRaw}`);
+
+    const sslEnabled = (process.env.DB_SSL || '').trim().toLowerCase() === 'true';
+
+    db = {
+      host,
+      port: Number(portRaw),
+      user,
+      password,
+      database: name,
+      ...(sslEnabled ? { ssl: { rejectUnauthorized: true } } : {}),
+    };
+  }
+
+  const leaseRaw = (process.env.CONFIRM_LEASE_MS || '').trim() || '30000';
+  if (!/^\d+$/.test(leaseRaw) || Number(leaseRaw) <= 0) {
+    throw new ConfigError(`CONFIRM_LEASE_MS 应为正整数（毫秒），当前：${leaseRaw}`);
+  }
+
+  // 回执被其他执行者认领时，本请求最多等待多久再决定返回成功还是可重试失败
+  const waitRaw = (process.env.CONFIRM_WAIT_MS || '').trim() || '2000';
+  if (!/^\d+$/.test(waitRaw)) {
+    throw new ConfigError(`CONFIRM_WAIT_MS 应为非负整数（毫秒），当前：${waitRaw}`);
+  }
 
   const config = {
     envPath: env.path,
@@ -308,6 +378,11 @@ function loadConfig(opts = {}) {
     port: Number(portRaw),
     validateResponseSign,
     storePath,
+    storeDriver,
+    db,
+    dbTable: (process.env.DB_TABLE || '').trim() || 'aipay_orders',
+    confirmLeaseMs: Number(leaseRaw),
+    confirmWaitMs: Number(waitRaw),
 
     /** 私钥来源，仅用于自检输出（不含任何密钥内容） */
     privateKeySource: priv.source,

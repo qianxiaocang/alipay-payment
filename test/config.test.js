@@ -296,3 +296,49 @@ test('返回的配置对象被冻结', () => {
     assert.ok(Object.isFrozen(config));
   });
 });
+
+// ================================================================ 清单缺口回归
+
+test('响应验签不可关闭：设置 ALIPAY_VALIDATE_RESPONSE_SIGN=false 也无效', () => {
+  // 清单第一节「支付校验无旁路」：生产源码中不得存在可触达的跳过验签开关
+  withEnv(baseEnv({ ALIPAY_VALIDATE_RESPONSE_SIGN: 'false' }), (envPath) => {
+    const config = loadConfig({ envPath });
+    assert.equal(config.validateResponseSign, true, '验签必须恒定开启，环境变量不得关闭它');
+  });
+
+  // 任意其他写法也不得关掉
+  for (const v of ['0', 'no', 'off', 'FALSE']) {
+    withEnv(baseEnv({ ALIPAY_VALIDATE_RESPONSE_SIGN: v }), (envPath) => {
+      assert.equal(loadConfig({ envPath }).validateResponseSign, true);
+    });
+  }
+});
+
+test('禁止生产使用内存订单存储（:memory:）', () => {
+  // 清单第五节「生产实现完整性」：关键控制不得是「内存演示」
+  withEnv(baseEnv({ ORDER_STORE_PATH: ':memory:' }), (envPath) => {
+    assert.throws(() => loadConfig({ envPath }), (e) => {
+      assert.ok(e instanceof ConfigError);
+      assert.match(e.message, /:memory:/);
+      return true;
+    });
+  });
+});
+
+test('serviceId 不得为沙箱占位值 api_mock_service_id', () => {
+  // 清单第七节「AI 按量付费 serviceId 替换」
+  withEnv(baseEnv({ ALIPAY_SERVICE_ID: 'api_mock_service_id' }), (envPath) => {
+    assert.throws(() => loadConfig({ envPath }), (e) => {
+      assert.ok(e instanceof ConfigError);
+      assert.match(e.message, /api_mock_service_id/);
+      assert.ok(e.hints.some((h) => /serviceId/.test(h)), 'hints 应说明替换为真实 serviceId');
+      return true;
+    });
+  });
+});
+
+test('正常 serviceId 不受影响', () => {
+  withEnv(baseEnv({ ALIPAY_SERVICE_ID: 'service_ai_content_001' }), (envPath) => {
+    assert.equal(loadConfig({ envPath }).serviceId, 'service_ai_content_001');
+  });
+});

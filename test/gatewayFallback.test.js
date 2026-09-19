@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 
 const { execGateway, isUnsignedResponseError, callPaymentVerify } = require('../src/verify');
 const { handleResourceRequest } = require('../src/paymentFlow');
-const { OrderStore } = require('../src/store');
+const { JsonFileOrderRepository } = require('../src/repository');
 const { makeConfig, makeProofHeader, FakeSdk } = require('./helpers');
 
 const silentLogger = { info() {}, warn() {}, error() {} };
@@ -159,7 +159,7 @@ test('callPaymentVerify 归一化后的字段可读，且标记签名状态', as
 
 test('端到端：开启响应验签时，配置类错误仍能看到真实错误码（而非 crypto 报错）', async () => {
   const config = makeConfig({ validateResponseSign: true });
-  const store = new OrderStore({ filePath: ':memory:' });
+  const store = new JsonFileOrderRepository({ filePath: ':memory:' });
   await store.init();
 
   const sdk = makingSdk({
@@ -175,7 +175,7 @@ test('端到端：开启响应验签时，配置类错误仍能看到真实错�
     paymentProofHeader: undefined,
     config,
     sdk,
-    store,
+    repository: store,
     resourceId: config.resourcePath,
     logger: silentLogger,
   });
@@ -185,7 +185,7 @@ test('端到端：开启响应验签时，配置类错误仍能看到真实错�
     paymentProofHeader: makeProofHeader(),
     config,
     sdk,
-    store,
+    repository: store,
     resourceId: config.resourcePath,
     logger: silentLogger,
   });
