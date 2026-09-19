@@ -235,6 +235,26 @@ RESOURCE_WRAP_RESPONSE=false
 
 **上线前必须替换为你的真实业务接口**，桩只是联调占位。
 
+#### 方式二：直接挂在本服务上（无需另起进程）
+
+如果你希望业务接口就在自己的域名下（例如 `https://你的域名/action`），
+本服务可以直接挂载一个占位路由：
+
+```bash
+MOUNT_DEMO_BUSINESS=true
+BUSINESS_API_LOCAL_PATH=/action
+BUSINESS_API_URL=https://你的域名/action
+```
+
+这样付款后服务会调用自己的 `/action` 拿到业务内容，不必额外部署一个服务。
+
+> ⚠️ `/action` 是**占位实现**：返回固定的 `ok` 与由幂等键推导的 `pick_token`，
+> 不做任何真实业务。上线前必须替换为真实业务接口，或设 `MOUNT_DEMO_BUSINESS=false` 关闭。
+> `npm run check-config` 会对此发出告警。
+
+> 配置校验会拒绝 `BUSINESS_API_LOCAL_PATH` 与 `RESOURCE_PATH` 相同的情况 ——
+> 那会让「付费后调业务接口」再次进入 402 流程，形成自调用循环。
+
 #### 不花钱的预检
 
 真实支付前先用这个确认「履约到底会返回什么」，避免白花一笔：

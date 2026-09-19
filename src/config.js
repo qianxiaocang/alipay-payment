@@ -388,6 +388,17 @@ function loadConfig(opts = {}) {
   // 载荷绑定：把「被收费的那次请求」与「实际执行的请求」绑定，防止低价付款+高价调用
   const bindPayload = (process.env.RESOURCE_BIND_PAYLOAD || 'true').trim().toLowerCase() !== 'false';
 
+  // 是否在本服务内挂载示例业务接口（占位），让 BUSINESS_API_URL 可以指向本服务
+  const mountDemoBusiness = (process.env.MOUNT_DEMO_BUSINESS || 'true').trim().toLowerCase() !== 'false';
+  const businessApiLocalPath = (process.env.BUSINESS_API_LOCAL_PATH || '').trim() || '/action';
+  if (!businessApiLocalPath.startsWith('/')) {
+    throw new ConfigError('BUSINESS_API_LOCAL_PATH 必须以 / 开头');
+  }
+  // 与资源路径相同会导致「付费后调业务接口 → 又进 402 流程」的自调用循环
+  if (businessApiLocalPath === resourcePath) {
+    throw new ConfigError('BUSINESS_API_LOCAL_PATH 不能与 RESOURCE_PATH 相同（会造成自调用循环）');
+  }
+
   // 请求体大小上限（字节）。按次付费的 API 常见为 JSON 入参，1MB 足够；
   // 调大可放宽，但要注意这也是单次请求的成本上界。
   const maxBodyRaw = (process.env.MAX_BODY_BYTES || '').trim() || '1048576';
@@ -444,6 +455,8 @@ function loadConfig(opts = {}) {
     resourceServiceType: (process.env.RESOURCE_SERVICE_TYPE || '').trim() || 'API_CALL',
     bindPayload,
     maxBodyBytes: Number(maxBodyRaw),
+    mountDemoBusiness,
+    businessApiLocalPath,
 
     /** 私钥来源，仅用于自检输出（不含任何密钥内容） */
     privateKeySource: priv.source,

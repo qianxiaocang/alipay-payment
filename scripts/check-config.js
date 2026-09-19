@@ -222,6 +222,12 @@ if (config.validateResponseSign === true) {
   bad('响应验签未开启 —— 违反「支付校验无旁路」要求');
 }
 
+if (config.mountDemoBusiness) {
+  warn(`本服务内挂载了占位业务接口 ${config.businessApiLocalPath} —— 上线前必须替换为真实业务或设 MOUNT_DEMO_BUSINESS=false`);
+} else {
+  ok(`未挂载占位业务接口（业务接口应在 ${config.businessApiUrl || "外部"} ）`);
+}
+
 if (config.resourceProvider === 'static') {
   warn('资源来源为 static（占位内容）—— 上线前必须切到 RESOURCE_PROVIDER=api 并配置 BUSINESS_API_URL');
 } else {

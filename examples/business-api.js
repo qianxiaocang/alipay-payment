@@ -30,23 +30,19 @@
  */
 
 const http = require('node:http');
-const crypto = require('node:crypto');
+const { derivePickToken, buildDemoBusinessResponse } = require('../src/demoBusiness');
 
 const PORT = Number(process.env.BUSINESS_API_PORT || 4000);
 const HOST = process.env.BUSINESS_API_HOST || '127.0.0.1';
 const ROUTE = process.env.BUSINESS_API_ROUTE || '/paid-api';
 
-/**
- * 由幂等键确定性推导 pick_token。
- * 同一订单号 → 同一 token；不同订单 → 不同 token。
- */
-function derivePickToken(idempotencyKey) {
-  const seed = idempotencyKey || crypto.randomUUID();
-  return `pick_${crypto.createHash('sha256').update(seed).digest('hex').slice(0, 32)}`;
-}
+const SERVED_BY = 'examples/business-api.js（联调桩，上线前请替换）';
 
 /**
  * 构造业务响应（导出以便单测）
+ *
+ * 实际逻辑复用 src/demoBusiness.js —— 与「挂在本服务上的 /action 路由」
+ * 共用同一份占位实现，避免两处漂移。
  *
  * @param {object} args
  * @param {string|null} args.body 买家请求体原文
@@ -55,28 +51,7 @@ function derivePickToken(idempotencyKey) {
  * @returns {object}
  */
 function buildResponse({ body, query = {}, idempotencyKey = null }) {
-  let parsedBody = null;
-  if (body && body.trim()) {
-    try {
-      parsedBody = JSON.parse(body);
-    } catch {
-      parsedBody = body; // 非 JSON 就原样带出
-    }
-  }
-
-  return {
-    ok: true,
-    pick_token: derivePickToken(idempotencyKey),
-    out_trade_no: idempotencyKey,
-    // 回显买家输入，用于确认透传链路
-    echo: {
-      method: 'POST',
-      query,
-      body: parsedBody,
-    },
-    served_at: new Date().toISOString(),
-    served_by: 'examples/business-api.js（联调桩，上线前请替换）',
-  };
+  return buildDemoBusinessResponse({ body, query, idempotencyKey, method: 'POST', servedBy: SERVED_BY });
 }
 
 // ---------------------------------------------------------------- HTTP 层

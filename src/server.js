@@ -15,6 +15,7 @@
 const express = require('express');
 const { handleResourceRequest } = require('./paymentFlow');
 const { fromExpressRequest } = require('./requestContext');
+const { buildDemoBusinessResponse } = require('./demoBusiness');
 
 /** 敏感字段掩码：任何进入日志的对象都先过一遍 */
 const SENSITIVE_KEYS = /private|secret|public_key|publickey|payment_proof|client_session|signature/i;
@@ -104,6 +105,42 @@ function createApp({ config, sdk, repository, logger = createLogger(), generateR
       );
     }
   });
+
+  // ---------------------------------------------------------------- 示例业务接口
+  //
+  // 用途：让 BUSINESS_API_URL 可以指向本服务的 <BUSINESS_API_LOCAL_PATH>（默认 /action），
+  //       从而在没有独立业务服务时也能把 402 链路端到端跑通。
+  //
+  // ⚠️ 这是【占位实现】：返回固定的 ok + 由幂等键推导的 pick_token，不做任何真实业务。
+  //    上线前必须替换为真实业务接口，或设 MOUNT_DEMO_BUSINESS=false 关闭本路由。
+  //    它不参与支付校验，也不经过 402 流程 —— 它只是「付费后要被调用的那个接口」。
+  if (config.mountDemoBusiness) {
+    const captureBusinessBody = express.raw({ type: () => true, limit: config.maxBodyBytes });
+
+    app.all(config.businessApiLocalPath, captureBusinessBody, (req, res) => {
+      const raw = Buffer.isBuffer(req.body)
+        ? req.body.toString('utf8')
+        : (req.body === undefined || req.body === null ? '' : String(req.body));
+
+      const payload = buildDemoBusinessResponse({
+        body: raw,
+        query: req.query || {},
+        idempotencyKey: req.get('Idempotency-Key') || null,
+        method: req.method,
+        servedBy: 'src/server.js 本地占位业务接口（上线前请替换）',
+      });
+
+      logger.info(
+        '[business-demo] %s %s | 幂等键=%s | body=%d 字节',
+        req.method,
+        req.path,
+        req.get('Idempotency-Key') || '(无)',
+        Buffer.byteLength(raw),
+      );
+
+      res.status(200).json(payload);
+    });
+  }
 
   // 兜底 404
   app.use((req, res) => {
